@@ -11,7 +11,14 @@ class GateCFDProvider(MarketDataProvider):
     name = "gate_cfd"
 
     def __init__(self) -> None:
-        self._capabilities = ProviderCapabilities(self.name, "gate_cfd", {"product_discovery", "trading_session", "ticker", "candles", "contract_specification", "reference_price", "spread", "commission", "position_read"}, True, True, ["CFD symbols are never inferred from a ticker name."])
+        self._capabilities = ProviderCapabilities(
+            self.name,
+            "gate_cfd",
+            {"provider_status"},
+            True,
+            True,
+            ["CFD catalog and market endpoints are not implemented; no CFD symbols are registered."],
+        )
 
     @property
     def capabilities(self) -> ProviderCapabilities:

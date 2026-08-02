@@ -1,25 +1,171 @@
 from __future__ import annotations
 
+import os
+from datetime import datetime, timezone
+from typing import Any
+from uuid import uuid4
+
 from engine_v2.domain.enums import DataQuality
+from engine_v2.domain.models import Observation
 
 from .base import MarketDataProvider, ProviderCapabilities, ProviderResult
+from .http import AsyncJSONClient, ProviderHTTPError
+
+
+BLS_API = "https://api.bls.gov/publicAPI/v2/timeseries/data"
+BEA_API = "https://apps.bea.gov/api/data"
 
 
 class OfficialEventsProvider(MarketDataProvider):
     name = "official_events"
 
-    def __init__(self) -> None:
-        self._capabilities = ProviderCapabilities(self.name, "official_events", {"federal_reserve", "bls", "bea", "treasury", "opendart", "exchange_announcements", "company_ir"}, False, True, ["Event source URLs are configured explicitly; no HTML scraper is used."])
+    def __init__(self, *, timeout: float = 12.0, client: AsyncJSONClient | None = None) -> None:
+        self.client = client or AsyncJSONClient(timeout)
+        self._capabilities = ProviderCapabilities(
+            self.name,
+            "official_events",
+            {"bls", "bea"},
+            False,
+            True,
+            ["BLS public JSON and BEA API connectors are implemented; Fed/OpenDART remain plan_not_available."],
+        )
 
     @property
     def capabilities(self) -> ProviderCapabilities:
         return self._capabilities
 
     async def discover_capabilities(self) -> ProviderCapabilities:
+        if not os.getenv("BEA_API_KEY"):
+            self._capabilities.notes.append("bea_api_key_missing")
         return self.capabilities
 
     async def discover_products(self, underlying_ids=None) -> ProviderResult:
-        return ProviderResult(self.name, quality=DataQuality.UNSUPPORTED, reason="event_calendar_backfill_is_event_specific")
+        return ProviderResult(self.name, quality=DataQuality.PLAN_NOT_AVAILABLE, reason="event_provider_uses_fetch_events_not_products")
 
     async def backfill(self, product, *, timeframe: str = "15m", limit: int = 300) -> ProviderResult:
-        return ProviderResult(self.name, quality=DataQuality.UNSUPPORTED, reason="event_calendar_requires_configured_source")
+        return await self.fetch_events(limit=limit)
+
+    async def fetch_events(self, *, limit: int = 20) -> ProviderResult:
+        results = []
+        for loader in (self.fetch_bls, self.fetch_bea):
+            result = await loader(limit=limit)
+            results.extend(result.data)
+        return ProviderResult(
+            self.name,
+            data=results,
+            quality=DataQuality.OK if results else DataQuality.PARTIAL,
+            reason=None if results else "official_event_sources_empty_or_unconfigured",
+            request_count=2,
+        )
+
+    async def fetch_bls(self, *, series_id: str = "CUSR0000SA0", limit: int = 20) -> ProviderResult:
+        now = datetime.now(timezone.utc)
+        try:
+            response = await self.client.get(
+                f"{BLS_API}/{series_id}",
+                {"startyear": str(now.year - 2), "endyear": str(now.year)},
+            )
+        except ProviderHTTPError as exc:
+            return ProviderResult(self.name, quality=DataQuality.PROVIDER_ERROR, reason=f"bls_http_{exc.status or 'error'}", request_count=1)
+        body = response.payload if isinstance(response.payload, dict) else {}
+        if body.get("status") != "REQUEST_SUCCEEDED":
+            return ProviderResult(self.name, quality=DataQuality.PROVIDER_ERROR, reason="bls_request_failed", request_count=1)
+        rows = []
+        series = (body.get("Results") or {}).get("series") if isinstance(body.get("Results"), dict) else []
+        for item in series or []:
+            for row in (item.get("data") or [])[:limit]:
+                event_time = _period_time(row)
+                rows.append(_observation(
+                    "bls",
+                    event_time,
+                    {
+                        "source": "bls",
+                        "series_id": series_id,
+                        "year": row.get("year"),
+                        "period": row.get("period"),
+                        "period_name": row.get("periodName"),
+                        "value": row.get("value"),
+                        "footnotes": row.get("footnotes"),
+                        "actual_endpoint": "api.bls.gov/publicAPI/v2/timeseries/data",
+                    },
+                ))
+        return ProviderResult(self.name, data=rows, quality=DataQuality.OK if rows else DataQuality.PARTIAL, reason=None if rows else "bls_empty", request_count=1)
+
+    async def fetch_bea(self, *, dataset: str = "NIPA", limit: int = 20) -> ProviderResult:
+        api_key = os.getenv("BEA_API_KEY")
+        if not api_key:
+            return ProviderResult(self.name, quality=DataQuality.AUTHENTICATION_REQUIRED, reason="bea_api_key_missing", request_count=0)
+        try:
+            response = await self.client.get(
+                BEA_API,
+                {
+                    "UserID": api_key,
+                    "method": "GetData",
+                    "datasetname": dataset,
+                    "TableName": "T10101",
+                    "Frequency": "Q",
+                    "Year": "ALL",
+                    "ResultFormat": "JSON",
+                },
+            )
+        except ProviderHTTPError as exc:
+            return ProviderResult(self.name, quality=DataQuality.PROVIDER_ERROR, reason=f"bea_http_{exc.status or 'error'}", request_count=1)
+        body = response.payload if isinstance(response.payload, dict) else {}
+        rows = ((body.get("BEAAPI") or {}).get("Results") or {}).get("Data") if isinstance(body.get("BEAAPI"), dict) else []
+        observations = []
+        for row in (rows or [])[-limit:]:
+            event_time = _bea_time(row.get("TimePeriod"))
+            observations.append(_observation(
+                "bea",
+                event_time,
+                {
+                    "source": "bea",
+                    "dataset": dataset,
+                    "table": row,
+                    "actual_endpoint": "apps.bea.gov/api/data",
+                },
+            ))
+        return ProviderResult(self.name, data=observations, quality=DataQuality.OK if observations else DataQuality.PARTIAL, reason=None if observations else "bea_empty", request_count=1)
+
+
+def _observation(source: str, event_time: datetime | None, payload: dict[str, Any]) -> Observation:
+    collected = datetime.now(timezone.utc)
+    quality = DataQuality.OK if event_time else DataQuality.TIMESTAMP_UNKNOWN
+    return Observation(
+        str(uuid4()),
+        "official_events",
+        "official_events",
+        None,
+        "official_event",
+        event_time,
+        event_time,
+        collected,
+        collected,
+        collected,
+        None,
+        quality,
+        "2.0",
+        payload,
+        None if event_time else "official_release_time_rounded_or_missing",
+    )
+
+
+def _period_time(row: dict[str, Any]) -> datetime | None:
+    try:
+        year = int(row.get("year"))
+        period = str(row.get("period") or "")
+        month = int(period[1:]) if period.startswith("M") else 12 if period == "Q04" else 1
+        return datetime(year, month, 1, tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _bea_time(value: Any) -> datetime | None:
+    text = str(value or "")
+    try:
+        if "Q" in text:
+            year, quarter = text.split("Q", 1)
+            return datetime(int(year), int(quarter) * 3, 1, tzinfo=timezone.utc)
+        return datetime(int(text[:4]), 1, 1, tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None

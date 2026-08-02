@@ -54,6 +54,8 @@ class V2Settings:
     data_dir: str = "data/v2"
     replay_time: str | None = None
     shadow_interval_seconds: int = 300
+    minimum_calibration_samples: int = 30
+    minimum_rr: float = 1.5
 
     @classmethod
     def from_env(cls) -> "V2Settings":
@@ -78,6 +80,12 @@ class V2Settings:
             data_dir=_env("V2_DATA_DIR", "data/v2"),
             replay_time=_env("V2_REPLAY_TIME", "") or None,
             shadow_interval_seconds=_int("V2_SHADOW_INTERVAL_SECONDS", 300),
+            default_timeframes=tuple(
+                item.strip() for item in _env("V2_TIMEFRAMES", "5m,15m,1h,4h,1d").split(",")
+                if item.strip()
+            ) or ("15m",),
+            minimum_calibration_samples=_int("V2_MIN_CALIBRATION_SAMPLES", 30),
+            minimum_rr=_float("V2_MIN_RR", 1.5),
         )
 
     def ensure_dirs(self, root: Path) -> None:
@@ -101,6 +109,9 @@ class V2Settings:
             "lead_lag_bars": self.lead_lag_bars,
             "minimum_sample_count": self.minimum_sample_count,
             "minimum_overlap_ratio": self.minimum_overlap_ratio,
+            "default_timeframes": list(self.default_timeframes),
+            "minimum_calibration_samples": self.minimum_calibration_samples,
+            "minimum_rr": self.minimum_rr,
         }
 
 

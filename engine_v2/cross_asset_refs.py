@@ -21,7 +21,15 @@ def build_relationships(products: dict[str, dict[str, Any]], series_by_product: 
     for product_id, product in products.items():
         underlying = str(product.get("underlying_id") or "")
         current = by_underlying.get(underlying)
-        if current is None or product.get("provider") == "yfinance_delayed":
+        if current is None:
+            by_underlying[underlying] = product_id
+            continue
+        current_product = products.get(current, {})
+        # Reference feeds are preferred for explanatory relationships; execution
+        # candidates remain restricted to role=tradable elsewhere.
+        if product.get("role") == "reference" and current_product.get("role") != "reference":
+            by_underlying[underlying] = product_id
+        elif product.get("provider") == "yfinance_delayed":
             by_underlying[underlying] = product_id
     output: dict[str, dict[str, dict[str, Any]]] = {}
     for product_id, product in products.items():
@@ -33,7 +41,14 @@ def build_relationships(products: dict[str, dict[str, Any]], series_by_product: 
             reference_id = by_underlying.get(reference)
             target = series_by_product.get(reference_id, []) if reference_id else []
             states[reference] = (
-                dynamic_relationship(source, target, minimum_samples=minimum_samples, minimum_overlap_ratio=minimum_overlap_ratio)
+                dynamic_relationship(
+                    source,
+                    target,
+                    minimum_samples=minimum_samples,
+                    minimum_overlap_ratio=minimum_overlap_ratio,
+                    timeframe="15m",
+                    session_filter="regular",
+                )
                 if source or target else insufficient_relationship(0, "source_and_target_missing")
             )
         output[product_id] = states

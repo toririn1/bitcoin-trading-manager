@@ -20,7 +20,14 @@ class BybitPublicProvider(MarketDataProvider):
 
     def __init__(self, *, timeout: float = 8.0, client: AsyncJSONClient | None = None) -> None:
         self.client = client or AsyncJSONClient(timeout)
-        self._capabilities = ProviderCapabilities(self.name, "bybit_linear", {"product_discovery", "candles", "trades", "orderbook", "funding", "open_interest", "liquidation_stream"}, False, True, ["REST backfill is implemented; websocket sequence/reconnect is exposed as a separate capability boundary."])
+        self._capabilities = ProviderCapabilities(
+            self.name,
+            "bybit_linear",
+            {"product_discovery", "candles", "trades", "open_interest"},
+            False,
+            True,
+            ["REST backfill implements only candles, recent trades, and open interest; orderbook/funding/liquidation are not claimed."],
+        )
 
     @property
     def capabilities(self) -> ProviderCapabilities:

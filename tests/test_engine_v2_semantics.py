@@ -170,7 +170,11 @@ def test_duckdb_and_parquet_are_real_write_backends(tmp_path):
     assert store.backend == "duckdb"
     assert store.append_observations(rows) == len(rows)
     assert store.append_observations(rows) == 0
-    assert len(list(Path(tmp_path / "raw").rglob("*.parquet"))) == len(rows)
+    parquet_files = list(Path(tmp_path / "raw").rglob("*.parquet"))
+    assert parquet_files
+    assert len(parquet_files) <= len(rows)
+    import pyarrow.parquet as pq
+    assert sum(pq.read_table(path).num_rows for path in parquet_files) == len(rows)
     assert store.observations(limit=100)
     store.close()
 

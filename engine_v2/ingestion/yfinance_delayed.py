@@ -66,7 +66,11 @@ class YFinanceDelayedProvider(MarketDataProvider):
                 quote_currency="USD" if underlying not in {"SK_HYNIX_KRX", "SAMSUNG_KRX", "KOSPI", "KOSDAQ", "USD_KRW"} else "KRW",
                 short_supported=False,
                 price_source="yfinance_delayed",
-                is_tradable=item["product_type"] in {ProductType.ETF, ProductType.EQUITY},
+                # yfinance is a delayed/reference feed, never an execution catalog.
+                is_tradable=False,
+                role="reference",
+                execution_venue=None,
+                market_data_provider=self.name,
                 trading_session=item["timezone"],
                 capabilities={
                     "display_name": item["name"],

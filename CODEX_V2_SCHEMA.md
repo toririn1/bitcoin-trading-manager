@@ -1,59 +1,55 @@
 # V2 schema contract
 
-## Observation
+## Product
 
-```json
-{
-  "observation_id": "...",
-  "provider": "binance",
-  "venue": "binance_futures",
-  "product_id": "BTC_BINANCE_PERP",
-  "data_type": "candle_15m",
-  "source_event_time": "2026-08-02T00:00:00Z",
-  "source_publish_time": null,
-  "first_seen_at": "2026-08-02T00:00:02Z",
-  "collected_at": "2026-08-02T00:00:02Z",
-  "available_at": "2026-08-02T00:00:02Z",
-  "processed_at": null,
-  "quality": "ok",
-  "schema_version": "2.0",
-  "payload": {}
-}
-```
+ProductSpec includes:
 
-`source_event_time` is never replaced with collection time. Missing timestamps produce `timestamp_unknown` and `is_fresh=false`.
+- role: tradable or reference
+- execution_venue
+- market_data_provider
+- is_tradable
+- short_supported
+- explicit fee/slippage configuration fields
 
-## Products and candidates
+Reference products can provide factors and cross-asset context but are excluded from candidate generation.
 
-- `AssetSpec` identifies an underlying asset.
-- `ProductSpec` identifies a tradeable venue product and is registered only from a known/returned catalog.
-- `OpportunityCandidate` contains long, short, and no-trade candidates with deterministic component scores, gross/cost/net edge, confidence, reason codes, risk codes, and source snapshot.
+## Candidate
 
-## Snapshot envelope
+OpportunityCandidate includes:
 
-All V2 endpoints return:
+- candidate_status: research_only_long, research_only_short, actionable_long, actionable_short, no_trade, or data_unavailable
+- valid_for_shadow
+- valid_for_user_execution
+- execution_permission
+- setup_type
+- entry_plan
+- trigger_price, stop_price, target_price, time_expiry
+- invalidation_reason
+- calibration_group
 
-```json
-{
-  "schema_version": "2.0",
-  "generated_at": "...",
-  "data": {}
-}
-```
+All directional candidates that have sufficient price data contain a deterministic trigger/stop/target plan. A missing plan is an explicit data-unavailable state; replay must not silently invent a trigger.
 
-Snapshot `data` contains `facts`, `computed_features`, `data_quality`, `factor_state`, `event_state`, `ranked_candidates`, `portfolio_constraints`, and `unsupported_data`.
+## Time and quality
 
-## Semantic labels
+Observation timestamps are UTC and preserve source event/publish/availability time. Candle features exclude forming candles. Cross-asset features floor timestamps to the configured timeframe, apply session masks, nearest tolerance, overlap, and delayed/current confirmation.
 
-- `actual_liquidation_event` / `liquidation_aggregate_actual`
-- `public_liquidation_snapshot` (pulse only, not market total)
-- `estimated_liquidation_cluster`
-- `trade_cvd`
-- `taker_bucket_delta_1h`
-- `rr_25d` only with actual option Greek delta
-- `estimated_skew_proxy` for any non-Greek estimate
-- `closed_candles` and `forming_candle`
+## Snapshot and decision
 
-## Decision package
+The snapshot contains facts, computed_features, data_quality, factor_state, event_state, ranked_candidates, portfolio_constraints, and unsupported_data.
 
-The deterministic decision contains `market_view`, `setup_verdict`, `setup_quality`, `candidate_rank`, `account_overlay`, `portfolio_overlay`, `product_guard`, `execution_permission`, and `final_action`. The final action may be `long`, `short`, `reduce`, `close`, `hold`, `watch`, `no_trade`, or `data_unavailable`.
+Decision final_action is:
+actionable_long, actionable_short, research_only_long, research_only_short, no_trade, or data_unavailable.
+
+The decision also contains execution_permission, which is derived from the selected candidate and account/data state.
+
+## Outcome and calibration
+
+Shadow outcomes contain trigger/fill/exit status, fees, slippage, funding, gross/net return, MFE, MAE, holding time, setup, horizon, regime, and predicted probability. Calibration groups by product/direction/setup/horizon/regime and exposes sample count, success rate, net/gross edge, confidence interval, Brier score, and insufficient_sample status.
+
+## Storage
+
+Normalized decisions, open shadow candidates, and outcomes are stored in DuckDB (or explicit SQLite development mode). Raw observations are partitioned Parquet batches with temp-file to atomic-rename writes. Payload hashes make restart ingestion idempotent. JSONL is audit-only when explicitly enabled.
+
+## Provider boundary
+
+Capability declarations list only implemented endpoints. CoinGlass liquidation, heatmap, futures/spot CVD, OI, and basis are actual opt-in endpoints; funding and ETF are plan-not-available. BLS and BEA official event connectors are actual when enabled/configured; Fed/OpenDART, Gate Stock/CFD, and KIS live remain status boundaries.

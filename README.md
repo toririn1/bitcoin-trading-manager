@@ -30,9 +30,9 @@ Binance/Bybit 시장 데이터 + provider-agnostic LLM 분석 + 거시경제 지
 
 | 지표 | 소스 | 설명 |
 |------|------|------|
-| 10Y 국채금리 (^TNX) | yfinance | 실시간 — 금리 상승 → BTC 부정적 |
-| 5Y 국채금리 (^FVX)  | yfinance | 실시간 — 단기 금리 환경 |
-| 달러 인덱스 (DX-Y.NYB) | yfinance | 실시간 — 달러 강세 → BTC 부정적 |
+| 10Y 국채금리 (^TNX) | yfinance | 지연/reference feed — 금리 수준과 변화 |
+| 5Y 국채금리 (^FVX)  | yfinance | 지연/reference feed — 단기 금리 환경 |
+| 달러 인덱스 (DX-Y.NYB) | yfinance | 지연/reference feed — 달러 수준과 변화 |
 | HYG/LQD 비율 | yfinance | 신용 스프레드 프록시 — 확대 시 리스크오프 선행 신호 |
 | IBIT (현물 BTC ETF) | yfinance | 기관 수급 프록시 — 거래량/20MA 추적 |
 | 스테이블코인 시총 | DefiLlama | 유동성 공급 지표 |
@@ -98,7 +98,7 @@ PREVENT_CONCURRENT_ANALYSIS=true
 | LLM API Key | openai_oauth 사용 시 불필요 | OpenAI, Anthropic 또는 호환 provider |
 | Binance API Key + Secret | 선택 | [binance.com → API 관리](https://www.binance.com/ko/my/settings/api-management) |
 
-> FRED API 키는 더 이상 필요하지 않습니다. 금리·달러 데이터는 yfinance 실시간 시세로 대체되었습니다.
+> V2에서 yfinance는 지연된 reference feed입니다. 실행 venue 상품과 분리되며, reference 가격은 주문 후보로 스캔되지 않습니다.
 
 > **Binance API 권한 설정:** 분석 전용이면 read-only 권한만 권장합니다. 출금(Withdrawal) 권한은 절대 부여하지 말고, 주문/선물 거래 권한도 켜지 마세요.
 
@@ -193,7 +193,7 @@ bitcoin-trading-manager/
 - **피보나치 스윙**: 스윙 고저 기반 되돌림 레벨 자동 계산
 
 ### 거시경제 지표 해석
-- **금리 상승 + 달러 강세** → 위험자산 매도 압력
+- 금리·달러는 위험선호 해석에 쓰는 reference factor이며, 단일 고정 인과로 확정하지 않고 timeframe·session·freshness와 함께 평가합니다.
 - **스테이블코인 시총 증가 + USDT 도미넌스 하락** → 크립토 매수세 유입
 - **BTC 도미넌스 상승** → 알트코인보다 BTC 선호 (리스크 오프 내 상대 강세)
 
@@ -240,6 +240,6 @@ V2 endpoints are additive under /api/v2/:
 - /api/v2/evaluation/summary
 - /api/v2/evaluation/calibration
 
-V2 defaults to explicit live mode. Use V2_MODE=fixture only for the demo endpoint, or V2_MODE=replay for point-in-time storage replay; live never falls back to fixture. V2_LIVE_ENABLED=true is required for live collection. Fixture data is marked synthetic and cannot produce an actionable trade. Product symbols for SOXL and SK Hynix are registered only from discovery; they are not guessed. V2 never creates, changes, cancels, or executes an order.
+V2 defaults to explicit live mode. Use V2_MODE=fixture only for deterministic tests, or V2_MODE=replay for point-in-time storage replay; live never falls back to fixture. V2_LIVE_ENABLED=true is required for live collection. yfinance products are role=reference and are excluded from candidates. Venue-discovered products are the only tradable candidates; spot products never receive short candidates. Fixture/research candidates may be shadow-replayed, but valid_for_user_execution remains false and V2 never creates, changes, cancels, or executes an order.
 
 See CODEX_V2_SOURCE_AUDIT.md, CODEX_V2_SCHEMA.md, CODEX_V2_STATE.md, and CODEX_V2_REPORT.md.

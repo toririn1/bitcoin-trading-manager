@@ -122,8 +122,13 @@ def register_v2_routes(app: FastAPI, root_dir: str | Path | None = None) -> V2En
         return envelope(get_engine(request).storage.evaluation_summary())
 
     @router.get("/evaluation/calibration")
-    async def evaluation_calibration():
-        return envelope({"brier_score": None, "log_loss": None, "ece": None, "quality": "partial", "reason": "outcome_store_needs_shadow_history"})
+    async def evaluation_calibration(request: Request):
+        engine = get_engine(request)
+        return envelope(
+            engine.storage.calibration_summary(
+                min_samples=engine.settings.minimum_calibration_samples
+            )
+        )
 
     @router.get("/status")
     async def status(request: Request):

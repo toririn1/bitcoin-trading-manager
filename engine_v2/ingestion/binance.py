@@ -32,7 +32,7 @@ class BinancePublicProvider(MarketDataProvider):
         self._capabilities = ProviderCapabilities(
             provider_name=self.name,
             venue="binance_futures" if futures else "binance_spot",
-            capabilities={"product_discovery", "candles", "trades", "orderbook", "mark_price", "funding", "open_interest", "public_liquidation_snapshot"},
+            capabilities={"product_discovery", "candles", "trades", "orderbook", "mark_price", "funding", "open_interest"},
             requires_auth=False,
             read_only=True,
             notes=["private liquidation endpoint is intentionally not used; public liquidation data is only a pulse/snapshot."],

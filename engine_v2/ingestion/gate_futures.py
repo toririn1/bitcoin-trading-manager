@@ -20,7 +20,14 @@ class GateFuturesProvider(MarketDataProvider):
     def __init__(self, *, settle: str = "usdt", timeout: float = 8.0, client: AsyncJSONClient | None = None) -> None:
         self.settle = settle
         self.client = client or AsyncJSONClient(timeout)
-        self._capabilities = ProviderCapabilities(self.name, f"gate_{settle}_futures", {"product_discovery", "ticker", "mark_price", "funding", "open_interest", "candles", "orderbook", "trades"}, False, True, ["Only GET market endpoints are implemented."])
+        self._capabilities = ProviderCapabilities(
+            self.name,
+            f"gate_{settle}_futures",
+            {"product_discovery", "candles"},
+            False,
+            True,
+            ["Only contracts and candlesticks are implemented; ticker/orderbook/trades/mark/funding/open_interest are not claimed."],
+        )
 
     @property
     def capabilities(self) -> ProviderCapabilities:

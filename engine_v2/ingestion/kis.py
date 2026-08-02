@@ -11,7 +11,14 @@ class KISProvider(MarketDataProvider):
     name = "kis"
 
     def __init__(self) -> None:
-        self._capabilities = ProviderCapabilities(self.name, "kis", {"krx_trades", "us_trades", "market_indices", "sessions", "candles"}, True, True, ["Fixture parsing is available; live endpoints require configured read-only credentials and account environment."])
+        self._capabilities = ProviderCapabilities(
+            self.name,
+            "kis",
+            {"provider_status"},
+            True,
+            True,
+            ["KIS live market/account endpoints are not implemented; fixture parsing is outside live capability claims."],
+        )
 
     @property
     def capabilities(self) -> ProviderCapabilities:

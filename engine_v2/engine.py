@@ -137,9 +137,11 @@ class V2Engine:
         await self.manager.discover(TARGET_UNDERLYINGS)
         limit = int(os.getenv("V2_LIVE_LIMIT", "120"))
         products = list(self.registry.tradable_products())
+        timeframes = self.settings.default_timeframes
         results = await asyncio.gather(*(
-            self.manager.backfill(product.product_id, timeframe="15m", limit=limit)
+            self.manager.backfill(product.product_id, timeframe=timeframe, limit=limit)
             for product in products
+            for timeframe in timeframes
         ))
         observations = [observation for result in results for observation in result.data]
         if os.getenv("COINGLASS_ENABLED", "").lower() in {"1", "true", "yes"} and os.getenv("COINGLASS_API_KEY"):
@@ -149,6 +151,12 @@ class V2Engine:
                 result = await provider.backfill(btc, timeframe="15m", limit=limit)
                 self.storage.append_observations(result.data)
                 observations.extend(result.data)
+
+        official_events = self.manager.providers.get("official_events")
+        if os.getenv("OFFICIAL_EVENTS_ENABLED", "").lower() in {"1", "true", "yes"} and official_events is not None:
+            event_result = await official_events.fetch_events(limit=100)
+            self.storage.append_observations(event_result.data)
+            observations.extend(event_result.data)
 
         deribit = self.manager.providers.get("deribit")
         option_limit = max(0, int(os.getenv("V2_OPTION_SAMPLE", "12")))
@@ -191,7 +199,7 @@ class V2Engine:
         product_rows = [
             product.to_dict()
             for product in self.registry.products.values()
-            if product.is_tradable or product.product_id in by_product
+            if (product.role == "tradable" and product.is_tradable) or product.product_id in by_product
         ]
         candidate_rows = [product.to_dict() for product in self.registry.tradable_products()]
         product_by_id = {row["product_id"]: row for row in product_rows}
@@ -240,6 +248,23 @@ class V2Engine:
                 "liquidity_vacuum_score": state["features"].get("microstructure", {}).get("orderbook", {}).get("liquidity_vacuum_score"),
             })
 
+        ages_by_underlying = {
+            str(state.get("product", {}).get("underlying_id") or product_id): state.get("source_age_seconds")
+            for product_id, state in product_snapshots.items()
+        }
+        usd_krw_age = ages_by_underlying.get("USD_KRW")
+        for product_id, state in product_snapshots.items():
+            underlying_age = ages_by_underlying.get(
+                str(state.get("product", {}).get("underlying_id") or product_id)
+            )
+            context = state.setdefault("product_context", {})
+            context["underlying_price_age"] = underlying_age
+            context["underlying_price_stale"] = (
+                underlying_age is None or underlying_age > self.settings.max_data_age_seconds
+            )
+            context["underlying_stale"] = context["underlying_price_stale"]
+            context["underlying_close_age"] = underlying_age
+            context["usd_krw_age"] = usd_krw_age
         global_quality = _quality(records, mode)
         factors = factor_state(latest_return_by_underlying)
         positions = account.get("positions")
@@ -263,7 +288,10 @@ class V2Engine:
                 "data_quality": state["data_quality"],
                 "costs": state["costs"],
                 "product_context": state["product_context"],
-                "calibrated_edges": {},
+                "calibrated_edges": self.storage.calibrated_edges(
+                    min_samples=self.settings.minimum_calibration_samples
+                ),
+                "min_rr": self.settings.minimum_rr,
                 "snapshot_id": None,
             }
             candidates.extend(scan_opportunities([product], base, min_net_edge_bps=self.settings.min_net_edge_bps))
@@ -304,6 +332,7 @@ class V2Engine:
         self.last_snapshot = snapshot
         self.last_decision = self._decision_from_snapshot(snapshot)
         self.storage.save_decision(snapshot["snapshot_id"], decision_time, self.last_decision)
+        self.storage.save_candidates(snapshot["snapshot_id"], decision_time, snapshot["ranked_candidates"])
         return snapshot
 
     def _apply_portfolio_risk(
@@ -397,19 +426,27 @@ class V2Engine:
         age = (decision_time - latest_event).total_seconds() if latest_event else None
         product_context = {
             "underlying_price_age": age,
+            "underlying_price_stale": age is None or age > self.settings.max_data_age_seconds,
             "underlying_stale": age is None or age > self.settings.max_data_age_seconds,
             "krx_session_state": _latest_session(records),
             "underlying_close_age": age,
-            "usd_krw_age": age,
+            "usd_krw_age": None,
             "funding": derivatives.get("weighted_funding"),
             "basis": derivatives.get("annualized_basis"),
             "oi_concentration": derivatives.get("venue_oi_share"),
             "spot_perp_divergence": None,
         }
+        configured_slippage = product.get("estimated_slippage_bps")
+        derived_slippage = (
+            float(orderbook.get("spread_bps")) / 2
+            if orderbook.get("spread_bps") is not None else None
+        )
         costs = {
             "spread_bps": orderbook.get("spread_bps"),
-            "taker_fee_bps": None,
-            "estimated_slippage_bps": None,
+            "taker_fee_bps": product.get("taker_fee_bps"),
+            "maker_fee_bps": product.get("maker_fee_bps"),
+            "estimated_slippage_bps": configured_slippage if configured_slippage is not None else derived_slippage,
+            "slippage_source": "configured" if configured_slippage is not None else "derived",
         }
         return {
             "product": product,
@@ -427,20 +464,30 @@ class V2Engine:
 
     def _decision_from_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         candidates = snapshot.get("ranked_candidates", [])
-        top = next(
-            (item for item in candidates if item.get("valid") and item.get("direction") != "no_trade"),
-            None,
-        )
+        directional = [
+            item for item in candidates
+            if item.get("direction") in {"long", "short"}
+            and (item.get("valid_for_shadow") or item.get("valid_for_user_execution"))
+        ]
+        top = directional[0] if directional else None
         no_trade = next(
             (item for item in candidates if item.get("direction") == "no_trade"),
             None,
         )
         selected = top or no_trade
-        final_action = selected.get("direction", "data_unavailable") if selected else "data_unavailable"
-        if selected and not selected.get("valid") and final_action != "no_trade":
-            final_action = "no_trade"
         if snapshot.get("data_unavailable"):
             final_action = "data_unavailable"
+            permission = "data_unavailable"
+        elif selected is None:
+            final_action = "no_trade"
+            permission = "no_trade"
+        else:
+            final_action = selected.get("candidate_status") or "no_trade"
+            permission = selected.get("execution_permission") or "data_unavailable"
+        setup_verdict = (
+            "actionable" if top and str(top.get("candidate_status", "")).startswith("actionable_")
+            else "research_only" if top else "no_trade"
+        )
         return {
             "schema_version": "2.0",
             "generated_at": snapshot.get("generated_at"),
@@ -451,13 +498,13 @@ class V2Engine:
             "data_quality": snapshot.get("data_quality", {}),
             "account_status": (snapshot.get("account_overlay") or {}).get("status", "data_unavailable"),
             "market_view": snapshot.get("computed_features", {}).get("regime", {}),
-            "setup_verdict": "actionable" if top else "no_trade",
+            "setup_verdict": setup_verdict,
             "setup_quality": selected.get("setup_quality") if selected else "unknown",
             "candidate_rank": candidates,
             "account_overlay": snapshot.get("account_overlay", {}),
             "portfolio_overlay": snapshot.get("portfolio_constraints", {}),
             "product_guard": {},
-            "execution_permission": "data_unavailable",
+            "execution_permission": permission,
             "final_action": final_action,
             "warnings": snapshot.get("unsupported_data", []),
         }
@@ -500,12 +547,21 @@ def _record(value: Any) -> dict[str, Any]:
 
 
 def _technical(records: list[dict[str, Any]], minimum: int) -> dict[str, Any]:
-    candles = [
-        record.get("payload") or {}
-        for record in records
-        if str(record.get("data_type", "")).startswith("candle_")
-    ]
-    return closed_candle_features(candles, minimum_samples=min(30, minimum))
+    by_timeframe: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        data_type = str(record.get("data_type", ""))
+        if not data_type.startswith("candle_"):
+            continue
+        timeframe = data_type.removeprefix("candle_")
+        by_timeframe[timeframe].append(record.get("payload") or {})
+    # The decision timeframe is explicit and never silently mixes 5m/15m/1h.
+    selected = by_timeframe.get("15m")
+    if not selected:
+        selected = next(
+            (by_timeframe[key] for key in ("5m", "1h", "4h", "1d") if by_timeframe.get(key)),
+            [],
+        )
+    return closed_candle_features(selected, minimum_samples=min(30, minimum))
 
 
 def _quality(records: list[dict[str, Any]], mode: str) -> dict[str, Any]:
@@ -525,10 +581,18 @@ def _quality(records: list[dict[str, Any]], mode: str) -> dict[str, Any]:
 
 
 def _return_series(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    candles = []
+    by_timeframe: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in records:
-        if not str(record.get("data_type", "")).startswith("candle_"):
+        data_type = str(record.get("data_type", ""))
+        if not data_type.startswith("candle_"):
             continue
+        by_timeframe[data_type.removeprefix("candle_")].append(record)
+    selected = next(
+        (by_timeframe[key] for key in ("15m", "5m", "1h", "4h", "1d") if by_timeframe.get(key)),
+        [],
+    )
+    candles = []
+    for record in selected:
         payload = record.get("payload") or {}
         if payload.get("is_final") is not True or payload.get("close") is None:
             continue
@@ -537,13 +601,18 @@ def _return_series(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             close = float(payload["close"])
         except (TypeError, ValueError):
             continue
-        candles.append((timestamp, close))
+        candles.append((timestamp, close, payload.get("session")))
     candles.sort(key=lambda row: str(row[0]))
     output = []
     previous = None
-    for timestamp, close in candles:
+    for timestamp, close, session in candles:
         if previous not in (None, 0):
-            output.append({"timestamp": timestamp, "return": close / previous - 1})
+            output.append({
+                "timestamp": timestamp,
+                "return": close / previous - 1,
+                "session": session,
+                "timeframe": "15m" if by_timeframe.get("15m") else (selected[0].get("data_type", "").removeprefix("candle_") if selected else None),
+            })
         previous = close
     return output
 

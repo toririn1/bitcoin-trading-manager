@@ -52,7 +52,13 @@ class AssetRegistry:
         return [p for p in self.products.values() if p.underlying_id == underlying_id]
 
     def tradable_products(self) -> list[ProductSpec]:
-        return [p for p in self.products.values() if p.is_tradable]
+        return [
+            p for p in self.products.values()
+            if p.is_tradable and p.role == "tradable"
+        ]
+
+    def reference_products(self) -> list[ProductSpec]:
+        return [p for p in self.products.values() if p.role == "reference"]
 
     def to_dict(self) -> dict:
         return {
@@ -99,9 +105,9 @@ def build_default_registry() -> AssetRegistry:
     # Only BTC products with known public venue identifiers are seeded. Equity,
     # CFD, and Gate products are added only after provider discovery.
     for product in (
-        ProductSpec("BTC_BINANCE_PERP", "BTC", "binance", "binance_futures", "BTCUSDT", ProductType.PERPETUAL, quote_currency="USDT", settlement_currency="USDT", funding_supported=True, short_supported=True, is_tradable=True, price_source="binance_public"),
-        ProductSpec("BTC_BINANCE_SPOT", "BTC", "binance", "binance_spot", "BTCUSDT", ProductType.SPOT, quote_currency="USDT", settlement_currency="USDT", short_supported=False, is_tradable=True, price_source="binance_public"),
-        ProductSpec("BTC_BYBIT_PERP", "BTC", "bybit", "bybit_linear", "BTCUSDT", ProductType.PERPETUAL, quote_currency="USDT", settlement_currency="USDT", funding_supported=True, short_supported=True, is_tradable=True, price_source="bybit_public"),
+        ProductSpec("BTC_BINANCE_PERP", "BTC", "binance", "binance_futures", "BTCUSDT", ProductType.PERPETUAL, quote_currency="USDT", settlement_currency="USDT", funding_supported=True, short_supported=True, is_tradable=True, price_source="binance_public", role="tradable", taker_fee_bps=4.0, maker_fee_bps=2.0),
+        ProductSpec("BTC_BINANCE_SPOT", "BTC", "binance", "binance_spot", "BTCUSDT", ProductType.SPOT, quote_currency="USDT", settlement_currency="USDT", short_supported=False, is_tradable=True, price_source="binance_public", role="tradable", taker_fee_bps=10.0, maker_fee_bps=10.0),
+        ProductSpec("BTC_BYBIT_PERP", "BTC", "bybit", "bybit_linear", "BTCUSDT", ProductType.PERPETUAL, quote_currency="USDT", settlement_currency="USDT", funding_supported=True, short_supported=True, is_tradable=True, price_source="bybit_public", role="tradable", taker_fee_bps=5.5, maker_fee_bps=2.0),
     ):
         registry.register_product(product)
     for key in ("SOXL", "SK_HYNIX_KRX"):

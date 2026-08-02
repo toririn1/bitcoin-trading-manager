@@ -112,11 +112,22 @@ class ProductSpec:
     is_tradable: bool = False
     capabilities: dict[str, Any] = field(default_factory=dict)
     discovered_at: datetime | None = None
+    role: str | None = None
+    execution_venue: str | None = None
+    market_data_provider: str | None = None
+    maker_fee_bps: float | None = None
+    taker_fee_bps: float | None = None
+    estimated_slippage_bps: float | None = None
 
     def __post_init__(self) -> None:
         self.discovered_at = ensure_utc(self.discovered_at)
         if not self.product_id or not self.underlying_id or not self.venue_symbol:
             raise ValueError("product_id, underlying_id, and venue_symbol are required")
+        self.role = self.role or ("tradable" if self.is_tradable else "reference")
+        if self.role not in {"tradable", "reference"}:
+            raise ValueError("ProductSpec.role must be tradable or reference")
+        self.execution_venue = self.execution_venue or self.venue
+        self.market_data_provider = self.market_data_provider or self.provider
 
     def to_dict(self) -> dict[str, Any]:
         return to_dict(asdict(self))
@@ -327,6 +338,17 @@ class OpportunityCandidate:
     risk_codes: list[str] = field(default_factory=list)
     source_snapshot_id: str | None = None
     valid: bool = True
+    candidate_status: str = "no_trade"
+    valid_for_shadow: bool = False
+    valid_for_user_execution: bool = False
+    setup_type: str = "unknown"
+    trigger_price: float | None = None
+    stop_price: float | None = None
+    target_price: float | None = None
+    time_expiry: datetime | None = None
+    invalidation_reason: str | None = None
+    execution_permission: str = "data_unavailable"
+    calibration_group: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return to_dict(asdict(self))

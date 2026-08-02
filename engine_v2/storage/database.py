@@ -108,16 +108,30 @@ class V2Storage:
                 decision_time VARCHAR NOT NULL,
                 payload_json VARCHAR NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS shadow_candidates (
+                candidate_id VARCHAR PRIMARY KEY,
+                snapshot_id VARCHAR,
+                decision_time VARCHAR NOT NULL,
+                product_id VARCHAR NOT NULL,
+                direction VARCHAR NOT NULL,
+                status VARCHAR NOT NULL,
+                opened_at VARCHAR NOT NULL,
+                closed_at VARCHAR,
+                outcome_id VARCHAR,
+                payload_json VARCHAR NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_shadow_candidates_status
+                ON shadow_candidates(status, product_id, direction);
             """
         if self.backend == "sqlite_explicit":
             self._db.executescript(schema_sql)
         else:
             self._db.execute(schema_sql)
-        self._db.execute(
-            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?) ON CONFLICT DO NOTHING",
-            (1, self._timestamp(datetime.now(timezone.utc)),
-        )
-        )
+        for version in (1, 2):
+            self._db.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?) ON CONFLICT DO NOTHING",
+                (version, self._timestamp(datetime.now(timezone.utc))),
+            )
         self._db.commit()
 
     @staticmethod
@@ -141,7 +155,7 @@ class V2Storage:
             "duckdb_path": str(self.duckdb_path) if self.backend == "duckdb" else None,
             "sqlite_path": str(self.root / "engine.sqlite3") if self.backend == "sqlite_explicit" else None,
             "parquet_root": str(self.parquet_root),
-            "schema_version": 1,
+            "schema_version": 2,
         }
 
     def _existing(self, observations: list[Observation]) -> tuple[set[str], set[str]]:
@@ -224,31 +238,44 @@ class V2Storage:
         except Exception:
             self._db.rollback()
             raise
-        for observation, payload_hash, _ in candidates:
-            self._write_raw(observation, payload_hash)
+        self._write_raw_batch(candidates)
         return len(candidates)
 
-    def _write_raw(self, observation: Observation, payload_hash: str) -> None:
-        event_date = (observation.source_event_time or observation.collected_at).date().isoformat()
-        directory = self.parquet_root / f"provider={_safe(observation.provider)}" / f"type={_safe(observation.data_type)}" / f"date={event_date}"
-        directory.mkdir(parents=True, exist_ok=True)
-        record = observation.to_dict()
-        record.update({
-            "payload_hash": payload_hash,
-            "source_event_time": self._timestamp(observation.source_event_time),
-            "collected_at": self._timestamp(observation.collected_at),
-            "available_at": self._timestamp(observation.available_at),
-            "payload_json": json.dumps(to_dict(observation.payload), sort_keys=True, default=str),
-        })
-        if self.parquet_available:
-            import pyarrow as pa
-            import pyarrow.parquet as pq
-            table = pa.Table.from_pylist([_flat_record(record)])
-            pq.write_table(table, directory / f"part-{uuid4().hex}.parquet", compression="zstd")
-        if self.audit_jsonl:
-            path = directory / "records.jsonl"
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True, default=str) + "\n")
+    def _write_raw_batch(self, candidates: list[tuple[Observation, str, str]]) -> None:
+        grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        for observation, payload_hash, _ in candidates:
+            event_date = (observation.source_event_time or observation.collected_at).date().isoformat()
+            key = (
+                _safe(observation.provider),
+                _safe(observation.data_type),
+                event_date,
+            )
+            record = observation.to_dict()
+            record.update({
+                "payload_hash": payload_hash,
+                "source_event_time": self._timestamp(observation.source_event_time),
+                "collected_at": self._timestamp(observation.collected_at),
+                "available_at": self._timestamp(observation.available_at),
+                "payload_json": json.dumps(to_dict(observation.payload), sort_keys=True, default=str),
+            })
+            grouped.setdefault(key, []).append(_flat_record(record))
+        for (provider, data_type, event_date), records in grouped.items():
+            directory = self.parquet_root / f"provider={provider}" / f"type={data_type}" / f"date={event_date}"
+            directory.mkdir(parents=True, exist_ok=True)
+            if self.parquet_available:
+                import os
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+                table = pa.Table.from_pylist(records)
+                temporary = directory / f".tmp-{uuid4().hex}.parquet"
+                target = directory / f"part-{uuid4().hex}.parquet"
+                pq.write_table(table, temporary, compression="zstd")
+                os.replace(temporary, target)
+            if self.audit_jsonl:
+                path = directory / "records.jsonl"
+                with path.open("a", encoding="utf-8") as handle:
+                    for record in records:
+                        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True, default=str) + "\n")
 
     def _rows(self, cursor: Any) -> list[dict[str, Any]]:
         if self.backend == "sqlite_explicit":
@@ -315,6 +342,139 @@ class V2Storage:
         )
         self._db.commit()
 
+    def save_candidates(
+        self,
+        snapshot_id: str,
+        decision_time: datetime,
+        candidates: Iterable[dict[str, Any]],
+    ) -> int:
+        rows = []
+        opened_at = self._timestamp(datetime.now(timezone.utc))
+        for candidate in candidates:
+            status = str(candidate.get("candidate_status") or "")
+            if not status.startswith(("research_only_", "actionable_")):
+                continue
+            rows.append((
+                str(candidate.get("candidate_id")),
+                snapshot_id,
+                self._timestamp(decision_time),
+                str(candidate.get("product_id")),
+                str(candidate.get("direction")),
+                "open",
+                opened_at,
+                None,
+                None,
+                json.dumps(candidate, ensure_ascii=False, default=str),
+            ))
+        if rows:
+            self._db.executemany(
+                "INSERT OR REPLACE INTO shadow_candidates VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            self._db.commit()
+        return len(rows)
+
+    def open_candidates(self, *, limit: int = 500) -> list[dict[str, Any]]:
+        cursor = self._db.execute(
+            "SELECT * FROM shadow_candidates WHERE status = ? ORDER BY decision_time LIMIT ?",
+            ("open", limit),
+        )
+        rows = self._rows(cursor)
+        for row in rows:
+            row["payload"] = json.loads(row.pop("payload_json"))
+        return rows
+
+    def close_candidate(
+        self,
+        candidate_id: str,
+        *,
+        status: str,
+        outcome_id: str | None = None,
+        closed_at: datetime | None = None,
+    ) -> None:
+        self._db.execute(
+            "UPDATE shadow_candidates SET status = ?, closed_at = ?, outcome_id = ? WHERE candidate_id = ?",
+            (
+                status,
+                self._timestamp(closed_at or datetime.now(timezone.utc)),
+                outcome_id,
+                candidate_id,
+            ),
+        )
+        self._db.commit()
+
+    def _outcome_payloads(self) -> list[dict[str, Any]]:
+        rows = self._rows(self._db.execute("SELECT payload_json FROM outcomes ORDER BY decision_time"))
+        output = []
+        for row in rows:
+            try:
+                value = json.loads(row["payload_json"])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(value, dict):
+                output.append(value)
+        return output
+
+    def calibration_summary(self, *, min_samples: int = 30) -> dict[str, Any]:
+        groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
+        for payload in self._outcome_payloads():
+            if payload.get("status") not in {None, "filled", "not_triggered", "not_filled"}:
+                continue
+            key = (
+                str(payload.get("product_id") or "unknown"),
+                str(payload.get("direction") or "unknown"),
+                str(payload.get("setup") or payload.get("setup_type") or "unknown"),
+                str(payload.get("horizon") or "intraday"),
+                str(payload.get("regime") or "unknown"),
+            )
+            groups.setdefault(key, []).append(payload)
+        summaries = []
+        for key, rows in groups.items():
+            net_values = [_number(row.get("net_return_bps")) for row in rows]
+            net_values = [value for value in net_values if value is not None]
+            gross_values = [_number(row.get("gross_return_bps")) for row in rows]
+            gross_values = [value for value in gross_values if value is not None]
+            successes = [1.0 if value > 0 else 0.0 for value in net_values]
+            sample_count = len(net_values)
+            item = {
+                "product_id": key[0],
+                "direction": key[1],
+                "setup": key[2],
+                "horizon": key[3],
+                "regime": key[4],
+                "sample_count": sample_count,
+                "status": "calibrated" if sample_count >= min_samples else "insufficient_sample",
+            }
+            if sample_count >= min_samples:
+                success_rate = sum(successes) / sample_count
+                standard_error = (success_rate * (1 - success_rate) / sample_count) ** 0.5
+                item.update({
+                    "gross_edge_bps": sum(gross_values) / len(gross_values) if gross_values else None,
+                    "net_edge_bps": sum(net_values) / sample_count,
+                    "success_rate": success_rate,
+                    "confidence_interval_95": [
+                        max(0.0, success_rate - 1.96 * standard_error),
+                        min(1.0, success_rate + 1.96 * standard_error),
+                    ],
+                    "brier_score": _brier(rows),
+                    "walk_forward": "expanding",
+                })
+            summaries.append(item)
+        return {
+            "minimum_samples": min_samples,
+            "groups": summaries,
+            "status": "calibrated" if any(item["status"] == "calibrated" for item in summaries) else "insufficient_sample",
+        }
+
+    def calibrated_edges(self, *, min_samples: int = 30) -> dict[str, dict[str, dict[str, Any]]]:
+        summary = self.calibration_summary(min_samples=min_samples)
+        output: dict[str, dict[str, dict[str, Any]]] = {}
+        for item in summary["groups"]:
+            if item["status"] != "calibrated":
+                continue
+            output.setdefault(item["product_id"], {})[item["direction"]] = item
+        return output
+
     def evaluation_summary(self) -> dict[str, Any]:
         decision_row = self._db.execute("SELECT COUNT(*) FROM decisions").fetchone()
         outcome_row = self._db.execute("SELECT COUNT(*) FROM outcomes").fetchone()
@@ -344,3 +504,23 @@ def _flat_record(record: dict[str, Any]) -> dict[str, Any]:
 
 def _safe(value: str) -> str:
     return "".join(character if character.isalnum() or character in {"_", "-", "."} else "_" for character in str(value))
+
+
+def _number(value: Any) -> float | None:
+    try:
+        number = float(value)
+        return number if number == number and abs(number) != float("inf") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _brier(rows: list[dict[str, Any]]) -> float | None:
+    values = []
+    for row in rows:
+        probability = _number(row.get("predicted_probability") or row.get("confidence"))
+        outcome = _number(row.get("net_return_bps"))
+        if probability is None or outcome is None:
+            continue
+        probability = max(0.0, min(1.0, probability))
+        values.append((probability - (1.0 if outcome > 0 else 0.0)) ** 2)
+    return sum(values) / len(values) if values else None

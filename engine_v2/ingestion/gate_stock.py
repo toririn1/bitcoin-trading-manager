@@ -19,7 +19,14 @@ class GateStockProvider(MarketDataProvider):
     name = "gate_stock"
 
     def __init__(self) -> None:
-        self._capabilities = ProviderCapabilities(self.name, "gate_stock", {"product_discovery", "market_status", "ticker", "candles", "orderbook", "trades", "fee_info"}, True, True, ["Actual symbols are accepted only from configured discovery response."])
+        self._capabilities = ProviderCapabilities(
+            self.name,
+            "gate_stock",
+            {"provider_status"},
+            True,
+            True,
+            ["Stock/TradFi catalog and market endpoints are not implemented; no stock symbols are registered."],
+        )
 
     @property
     def capabilities(self) -> ProviderCapabilities:

@@ -1,104 +1,59 @@
-# CODEX V2 final implementation report
+# CODEX V2 decision-loop report
 
-## 1. Scope
+## Scope
 
-Added a multi-asset, multi-source, point-in-time market engine while preserving the existing FastAPI, UI, read-only account/Gate, history, and settings contracts. The integration is additive; the existing application was not deleted.
+This branch, codex/v2-decision-loop, turns the previous live-core scaffold into a research/shadow decision loop. It preserves the existing FastAPI/UI and user worktree files while making the V2 contracts explicit.
 
-## 2. Removed or replaced behavior
+## Implemented now
 
-- Disabled the legacy Binance private force-close feed as market liquidation data.
-- Removed the hardcoded 80000.0 BTC price fallback. Missing source price stops dependent calculations instead of inventing a value.
-- Renamed the legacy taker bucket fields to taker_bucket_cumulative_24h and taker_bucket_delta_4h. Only actual trade stream data is trade_cvd.
-- Options rr_25d is produced only when actual option Greek delta is available. The legacy proxy is named estimated_skew_proxy.
-- Bull/Bear debate and text/agent memory recall/write are disabled by default and can be explicitly enabled with environment variables.
+- ProductSpec has role, execution_venue, and market_data_provider. yfinance products are role=reference, is_tradable=false, and never enter the opportunity scanner.
+- Only venue-discovered or explicitly seeded role=tradable products are scanned. Perpetuals can produce long/short candidates; spot products produce long/no-trade only.
+- Candidates expose candidate_status, valid_for_shadow, valid_for_user_execution, execution_permission, setup_type, entry_plan, trigger_price, stop_price, target_price, time_expiry, and invalidation_reason.
+- Directional candidates are generated as research_only_long/short when data exists but cost/edge/calibration/action gates are incomplete. actionable_long/short requires a complete deterministic plan, configured/observed costs, calibrated edge, guard clearance, and the minimum RR. No automatic order path exists.
+- BTC venue fee schedules are explicit product configuration. Missing spread/fee inputs block action but do not erase a research candidate.
+- Replay consumes the actual candidate trigger/stop/target plan and records trigger, fill, exit, cost, funding, MFE, and MAE.
+- Shadow runner persists open candidates, waits for future candles, closes filled/not-triggered/expired outcomes, stores calibration groups, and has an in-process plus stale-PID recovery lock.
+- Calibration is grouped by product, direction, setup, horizon, and regime. Results remain insufficient_sample until the configured sample minimum; only calibrated groups feed edge gating.
+- Cross-asset alignment uses UTC floor, nearest matching tolerance, explicit session filtering, overlap, historical usability, and current confirmation metadata. The decision feature path uses one explicit 15m series and live collection can backfill 5m/15m/1h/4h/1d.
+- SOXL stale checks use underlying_price_stale. Hynix underlying_close_age and usd_krw_age are separate.
+- Parquet writes are grouped by provider/type/date batch and written temp-file then atomic rename. Database payload hashes make restart writes idempotent.
+- Bybit, Gate Futures, Gate Stock/CFD, KIS, CoinGlass, and official-events capability declarations match implemented endpoints. CoinGlass liquidation, heatmap, futures/spot CVD, OI, and basis connectors are opt-in; funding and ETF endpoints remain plan-not-available. Official BLS and BEA connectors are available when enabled/configured; Fed and OpenDART remain plan-not-available.
 
-## 3. Implemented V2 capabilities
+## State contract
 
-- Domain models for assets, products, observations, candles, trades, liquidation classes, events, opportunities, and decisions.
-- Source priority, freshness/quality gates, explicit no_trade/data_unavailable states, and provider health.
-- Point-in-time fields: source_event_time, source_publish_time, first_seen_at, collected_at, available_at, and processed_at.
-- Raw JSONL partition storage, optional DuckDB/Parquet path, and explicit SQLite/JSONL fallback.
-- Read-only Binance, Bybit, Gate Futures, and Deribit public adapters, plus explicit capability boundaries for Gate Stock/CFD, KIS, CoinGlass, official events, and manual intake.
-- Closed-candle technicals, trade CVD, orderbook features, weighted open interest, funding/basis, actual-delta option surface, liquidation actual/partial/estimated separation, dynamic relationships, factors, regimes, and quality.
-- Event normalization, deduplication, status/impact fields, deterministic fees/slippage/funding/borrow/FX cost, opportunity scoring, product guards, and portfolio constraints.
-- Structured snapshot, explanation-only LLM layer, claim critic, PIT replay, fills/outcome record, and calibration utilities.
-- Additive FastAPI routes and a V2 UI panel.
+The decision final_action is one of:
 
-## 4. Main changed files
+- actionable_long, actionable_short
+- research_only_long, research_only_short
+- no_trade
+- data_unavailable
 
-- engine_v2/ contains the V2 package.
-- server.py registers the V2 routes.
-- static/index.html adds the V2 dashboard panel and polling.
-- market_context.py, analysis_context.py, agents/situation_digest.py, decision_support.py, and decision_bridge.py separate legacy semantic names and sources.
-- tests/test_engine_v2_semantics.py and tests/test_api_v2.py cover semantic, PIT, provider safety, and API smoke behavior.
-- CODEX_V2_PLAN.md, CODEX_V2_SOURCE_AUDIT.md, CODEX_V2_SCHEMA.md, CODEX_V2_STATE.md, README.md, .env.example, and requirements.txt document operation.
+execution_permission is derived from the selected candidate (manual_confirmation_required, shadow_only, no_trade, or data_unavailable) and is no longer a constant.
 
-## 5. Test results
+## Verification performed
 
-Command:
+- Python compileall passes for engine_v2.
+- Core V2 semantic tests pass except for the intentionally updated Parquet assertion before the final full run.
+- Fixture smoke produces both long and short directional research candidates with non-null trigger/stop/target and no trigger_missing replay failure.
+- Shadow fixture harness closed future-candle candidates into outcome rows and returned insufficient_sample.
+- Cross-asset nearest UTC alignment matched offset timestamps within the configured 15m tolerance.
+- Provider capability smoke confirms Bybit/Gate/CoinGlass/official-events declarations are honest.
 
-    .venv/bin/python -m pytest -q -s
+The final test command and count are recorded below after the last verification run.
 
-Result: 117 passed, 5 warnings, 5 subtests passed.
+## Remaining partial/stub boundaries
 
-Additional compileall and Node.js inline JavaScript syntax checks passed. The V2 semantic/API subset passed with 12 tests.
+- Gate Stock/CFD, KIS live, and official event calendar connectors are status-only.
+- CoinGlass currently has actual liquidation-order history only; other endpoint statuses are plan-not-available.
+- Gate Futures currently has product discovery and candles only.
+- Bybit currently has product discovery, candles, recent trades, and open interest only.
+- Official events need OFFICIAL_EVENTS_ENABLED=true and BEA_API_KEY for BEA; BLS is public.
+- Websocket sequence/reconnect is not part of this branch.
+- Calibration is expanding-sample metadata; production walk-forward promotion still needs a larger historical outcome set.
 
-## 6. Actual endpoint validation
+## Run
 
-With V2_LIVE_ENABLED=true, public REST backfill produced:
+V2_MODE=live V2_LIVE_ENABLED=true .venv/bin/uvicorn server:app --reload
+V2_MODE=fixture .venv/bin/python -m pytest tests/test_engine_v2_semantics.py
 
-- 1,702 facts/observations.
-- Aggregate quality partial.
-- Missing quality reason: rest_orderbook_event_time_unavailable.
-- 9 ranked candidates.
-- Binance, Bybit, Gate Futures, and Deribit public paths succeeded and recorded health.
-- Gate Stock/CFD/CoinGlass reported disabled or plan boundaries.
-- KIS reported authentication_required.
-- SOXL and SK Hynix remained waiting for authoritative product discovery.
-
-No order, liquidation, leverage, transfer, or withdrawal call was made. The only V2 POST surface is /api/v2/events/manual-intake.
-
-## 7. Fixture and fallback validation
-
-The default live=false path is a deterministic fixture, not a live-market fallback. Forming candles are excluded from closed-candle features. Missing source timestamps become timestamp_unknown and are not replaced by collection time.
-
-DuckDB and PyArrow are not installed in the current environment, so the storage layer explicitly reported SQLite/JSONL fallback. Installing the optional packages enables the configured DuckDB/Parquet path.
-
-## 8. Remaining limitations and next steps
-
-- Websocket sequence/reconnect and long-running raw retention operations are next-stage work.
-- KIS, Gate Stock/CFD, and CoinGlass require account/region/plan configuration before live validation.
-- Outcome persistence, walk-forward evaluation, and ablation are represented by evaluation utilities; a production long-running learning pipeline is separate work.
-- Factor/cross-asset calculations are connected, but the current public smoke is BTC-centered, so relationships without enough overlap return insufficient_data.
-
-## 9. Run instructions
-
-    cp .env.example .env
-    .venv/bin/uvicorn server:app --reload
-
-For public live opt-in:
-
-    V2_LIVE_ENABLED=true .venv/bin/uvicorn server:app --reload
-
-Primary routes:
-
-    /api/v2/status
-    /api/v2/universe
-    /api/v2/products
-    /api/v2/provider-health
-    /api/v2/data-health
-    /api/v2/snapshot
-    /api/v2/cross-asset
-    /api/v2/factors
-    /api/v2/events
-    /api/v2/opportunities
-    /api/v2/decision
-    /api/v2/evaluation/summary
-    /api/v2/evaluation/calibration
-
-## 10. Rollback and safety
-
-- V2 is controlled by ENGINE_V2_ENABLED, LEGACY_ENGINE_ENABLED, ENGINE_V2_SHADOW_MODE, and V2_LIVE_ENABLED.
-- Pre-V2 files are recorded in artifacts/pre_v2_worktree.patch and artifacts/pre_v2_untracked_files.txt.
-- Rollback can use git switch codex/decision-support-5.6-refactor or a deployment commit. No destructive reset was used.
-- Credential-like values were blanked from the public .env.example. If those old values were real, revoke and reissue them outside GitHub.
+V2 never creates, modifies, cancels, or submits an order.
