@@ -240,6 +240,6 @@ V2 endpoints are additive under /api/v2/:
 - /api/v2/evaluation/summary
 - /api/v2/evaluation/calibration
 
-V2 defaults to explicit live mode. Use V2_MODE=fixture only for deterministic tests, or V2_MODE=replay for point-in-time storage replay; live never falls back to fixture. V2_LIVE_ENABLED=true is required for live collection. yfinance products are role=reference and are excluded from candidates. Venue-discovered products are the only tradable candidates; spot products never receive short candidates. Fixture/research candidates may be shadow-replayed, but valid_for_user_execution remains false and V2 never creates, changes, cancels, or executes an order.
+V2 defaults to explicit live mode. Use V2_MODE=fixture only for deterministic tests, or V2_MODE=replay for point-in-time storage replay; live never falls back to fixture. V2_LIVE_ENABLED=true is required for live collection. yfinance products are role=reference and are excluded from candidates. Venue-discovered products are the only tradable candidates; spot products never receive short candidates. Only heuristic/data-quality-eligible candidates enter shadow replay; weak directional research candidates cannot outrank no_trade, valid_for_user_execution remains false, and V2 never creates, changes, cancels, or executes an order.
 
 See CODEX_V2_SOURCE_AUDIT.md, CODEX_V2_SCHEMA.md, CODEX_V2_STATE.md, and CODEX_V2_REPORT.md.

@@ -350,16 +350,40 @@ class V2Storage:
     ) -> int:
         rows = []
         opened_at = self._timestamp(datetime.now(timezone.utc))
+        open_keys: set[tuple[str, str, str]] = set()
+        for row in self._rows(self._db.execute(
+            "SELECT product_id, direction, payload_json FROM shadow_candidates WHERE status = ?",
+            ("open",),
+        )):
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError):
+                payload = {}
+            open_keys.add((
+                str(row["product_id"]),
+                str(row["direction"]),
+                str(payload.get("setup_type") or "unknown"),
+            ))
         for candidate in candidates:
             status = str(candidate.get("candidate_status") or "")
             if not status.startswith(("research_only_", "actionable_")):
                 continue
+            if not candidate.get("valid_for_shadow"):
+                continue
+            key = (
+                str(candidate.get("product_id")),
+                str(candidate.get("direction")),
+                str(candidate.get("setup_type") or "unknown"),
+            )
+            if key in open_keys:
+                continue
+            open_keys.add(key)
             rows.append((
                 str(candidate.get("candidate_id")),
                 snapshot_id,
                 self._timestamp(decision_time),
-                str(candidate.get("product_id")),
-                str(candidate.get("direction")),
+                key[0],
+                key[1],
                 "open",
                 opened_at,
                 None,

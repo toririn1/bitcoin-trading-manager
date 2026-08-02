@@ -46,8 +46,11 @@ def score_candidate(
     reasons: list[str] = ["no_trade_candidate"] if direction == Direction.NO_TRADE else []
     risks = list(guard.get("warnings", [])) + list(guard.get("reasons", []))
     gate_reasons: list[str] = []
+    heuristic_threshold = float(snapshot.get("min_heuristic_score") or 3.0)
 
     if direction != Direction.NO_TRADE:
+        if heuristic < heuristic_threshold:
+            gate_reasons.append("heuristic_below_threshold")
         if entry["trigger_price"] is None:
             gate_reasons.append("trigger_missing")
         if quality_score < 55:
@@ -88,7 +91,7 @@ def score_candidate(
             if not gate_reasons
             else f"research_only_{direction.value}"
         )
-        valid_for_shadow = quality_score >= 55
+        valid_for_shadow = quality_score >= 55 and heuristic >= heuristic_threshold
         valid_for_user_execution = not gate_reasons
         permission = "manual_confirmation_required" if valid_for_user_execution else "shadow_only"
         plan = entry["entry_plan"]

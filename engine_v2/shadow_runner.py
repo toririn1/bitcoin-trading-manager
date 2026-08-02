@@ -82,6 +82,12 @@ class ShadowRunner:
                 > decision_time
             ]
             expiry = parse_datetime(candidate.get("time_expiry"))
+            if expiry is not None:
+                future = [
+                    item for item in future
+                    if (parse_datetime(item.get("source_event_time") or (item.get("payload") or {}).get("open_time")) or datetime.min.replace(tzinfo=timezone.utc))
+                    <= expiry
+                ]
             if not future and (expiry is None or expiry > now):
                 continue
             if future:
@@ -92,7 +98,23 @@ class ShadowRunner:
                         fee_bps=float(candidate.get("estimated_cost_bps") or 0.0) / 2,
                     ),
                 )
+                if result.get("status") == "not_triggered" and (expiry is None or expiry > now):
+                    # Keep the candidate open until its stated validity window ends.
+                    # Known partial future is not a terminal calibration outcome.
+                    continue
+                if result.get("status") == "not_triggered":
+                    result = {
+                        **result,
+                        "status": "not_filled",
+                        "reason": "time_expiry",
+                        "failure_codes": list(dict.fromkeys([
+                            *(result.get("failure_codes") or []),
+                            "time_expiry",
+                        ])),
+                    }
             else:
+                if expiry is None or expiry > now:
+                    continue
                 result = {
                     "status": "not_filled",
                     "reason": "time_expiry",

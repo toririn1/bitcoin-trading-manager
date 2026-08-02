@@ -152,11 +152,11 @@ class V2Engine:
                 self.storage.append_observations(result.data)
                 observations.extend(result.data)
 
-        official_events = self.manager.providers.get("official_events")
-        if os.getenv("OFFICIAL_EVENTS_ENABLED", "").lower() in {"1", "true", "yes"} and official_events is not None:
-            event_result = await official_events.fetch_events(limit=100)
-            self.storage.append_observations(event_result.data)
-            observations.extend(event_result.data)
+        official_series = self.manager.providers.get("official_events")
+        if os.getenv("OFFICIAL_SERIES_ENABLED", "").lower() in {"1", "true", "yes"} and official_series is not None:
+            series_result = await official_series.fetch_series(limit=100)
+            self.storage.append_observations(series_result.data)
+            observations.extend(series_result.data)
 
         deribit = self.manager.providers.get("deribit")
         option_limit = max(0, int(os.getenv("V2_OPTION_SAMPLE", "12")))
@@ -292,6 +292,7 @@ class V2Engine:
                     min_samples=self.settings.minimum_calibration_samples
                 ),
                 "min_rr": self.settings.minimum_rr,
+                "min_heuristic_score": self.settings.minimum_heuristic_score,
                 "snapshot_id": None,
             }
             candidates.extend(scan_opportunities([product], base, min_net_edge_bps=self.settings.min_net_edge_bps))

@@ -23,11 +23,11 @@ class OfficialEventsProvider(MarketDataProvider):
         self.client = client or AsyncJSONClient(timeout)
         self._capabilities = ProviderCapabilities(
             self.name,
-            "official_events",
-            {"bls", "bea"},
+            "economic_series",
+            {"bls_series", "bea_series"},
             False,
             True,
-            ["BLS public JSON and BEA API connectors are implemented; Fed/OpenDART remain plan_not_available."],
+            ["BLS/BEA period observations only; release timestamps are unavailable, so this is not an event/reaction connector."],
         )
 
     @property
@@ -40,12 +40,12 @@ class OfficialEventsProvider(MarketDataProvider):
         return self.capabilities
 
     async def discover_products(self, underlying_ids=None) -> ProviderResult:
-        return ProviderResult(self.name, quality=DataQuality.PLAN_NOT_AVAILABLE, reason="event_provider_uses_fetch_events_not_products")
+        return ProviderResult(self.name, quality=DataQuality.PLAN_NOT_AVAILABLE, reason="economic_series_provider_not_tradable")
 
     async def backfill(self, product, *, timeframe: str = "15m", limit: int = 300) -> ProviderResult:
-        return await self.fetch_events(limit=limit)
+        return await self.fetch_series(limit=limit)
 
-    async def fetch_events(self, *, limit: int = 20) -> ProviderResult:
+    async def fetch_series(self, *, limit: int = 20) -> ProviderResult:
         results = []
         for loader in (self.fetch_bls, self.fetch_bea):
             result = await loader(limit=limit)
@@ -54,8 +54,21 @@ class OfficialEventsProvider(MarketDataProvider):
             self.name,
             data=results,
             quality=DataQuality.OK if results else DataQuality.PARTIAL,
-            reason=None if results else "official_event_sources_empty_or_unconfigured",
+            reason=None if results else "economic_series_sources_empty_or_unconfigured",
             request_count=2,
+        )
+
+    async def fetch_events(self, *, limit: int = 20) -> ProviderResult:
+        """Release-event ingestion is intentionally unavailable.
+
+        BLS/BEA observations expose measurement periods, not publication
+        timestamps. They must not be consumed as post-release event data.
+        """
+        return ProviderResult(
+            self.name,
+            quality=DataQuality.PLAN_NOT_AVAILABLE,
+            reason="release_timestamp_not_available",
+            request_count=0,
         )
 
     async def fetch_bls(self, *, series_id: str = "CUSR0000SA0", limit: int = 20) -> ProviderResult:
@@ -74,10 +87,10 @@ class OfficialEventsProvider(MarketDataProvider):
         series = (body.get("Results") or {}).get("series") if isinstance(body.get("Results"), dict) else []
         for item in series or []:
             for row in (item.get("data") or [])[:limit]:
-                event_time = _period_time(row)
-                rows.append(_observation(
+                period_start = _period_time(row)
+                rows.append(_economic_observation(
                     "bls",
-                    event_time,
+                    period_start,
                     {
                         "source": "bls",
                         "series_id": series_id,
@@ -114,10 +127,10 @@ class OfficialEventsProvider(MarketDataProvider):
         rows = ((body.get("BEAAPI") or {}).get("Results") or {}).get("Data") if isinstance(body.get("BEAAPI"), dict) else []
         observations = []
         for row in (rows or [])[-limit:]:
-            event_time = _bea_time(row.get("TimePeriod"))
-            observations.append(_observation(
+            period_start = _bea_time(row.get("TimePeriod"))
+            observations.append(_economic_observation(
                 "bea",
-                event_time,
+                period_start,
                 {
                     "source": "bea",
                     "dataset": dataset,
@@ -128,25 +141,34 @@ class OfficialEventsProvider(MarketDataProvider):
         return ProviderResult(self.name, data=observations, quality=DataQuality.OK if observations else DataQuality.PARTIAL, reason=None if observations else "bea_empty", request_count=1)
 
 
-def _observation(source: str, event_time: datetime | None, payload: dict[str, Any]) -> Observation:
+def _economic_observation(
+    source: str,
+    period_start: datetime | None,
+    payload: dict[str, Any],
+) -> Observation:
     collected = datetime.now(timezone.utc)
-    quality = DataQuality.OK if event_time else DataQuality.TIMESTAMP_UNKNOWN
+    enriched = {
+        **payload,
+        "period_start": period_start.isoformat().replace("+00:00", "Z") if period_start else None,
+        "timestamp_semantics": "measurement_period_only",
+        "release_timestamp_available": False,
+    }
     return Observation(
         str(uuid4()),
         "official_events",
         "official_events",
         None,
-        "official_event",
-        event_time,
-        event_time,
+        "economic_series",
+        None,
+        None,
         collected,
         collected,
         collected,
         None,
-        quality,
+        DataQuality.TIMESTAMP_UNKNOWN,
         "2.0",
-        payload,
-        None if event_time else "official_release_time_rounded_or_missing",
+        enriched,
+        "release_timestamp_unavailable",
     )
 
 

@@ -27,18 +27,31 @@ def dynamic_relationship(
         tolerance_seconds=tolerance_seconds or _timeframe_seconds(timeframe) // 2,
         session_filter=session_filter,
     )
+    overlap = len(pairs) / max(
+        int(alignment.get("source_count") or len(source_rows)),
+        int(alignment.get("target_count") or len(target_rows)),
+        1,
+    )
     if len(pairs) < minimum_samples:
         return _insufficient(
             len(pairs),
             "sample_count_below_minimum",
             alignment=alignment,
             timeframe=timeframe,
+            overlap=overlap,
+            current_confirmation=_current_confirmation(
+                source_rows, target_rows, pairs, alignment, timeframe,
+            ),
         )
     source_values = [item[0] for item in pairs]
     target_values = [item[1] for item in pairs]
     corr = _corr(source_values, target_values)
     best_lag, best_score = _best_lag(source_values, target_values, max_lag)
-    overlap = len(pairs) / max(len(source_rows), len(target_rows), 1)
+    overlap = len(pairs) / max(
+        int(alignment.get("source_count") or len(source_rows)),
+        int(alignment.get("target_count") or len(target_rows)),
+        1,
+    )
     stability = _rolling_stability(source_values, target_values)
     usable = overlap >= minimum_overlap_ratio and stability >= 0.25 and abs(corr or 0) >= 0.1
     return {
@@ -58,7 +71,7 @@ def dynamic_relationship(
         "alignment": alignment,
         "timeframe": timeframe,
         "historical_usable": usable,
-        "current_confirmation": _current_confirmation(source_rows, target_rows, pairs, timeframe),
+        "current_confirmation": _current_confirmation(source_rows, target_rows, pairs, alignment, timeframe),
     }
 
 
@@ -114,12 +127,15 @@ def _align(
             {
                 "method": "exact_legacy",
                 "matched": len(keys),
+                "source_count": len(usable_source),
+                "target_count": len(usable_target),
                 "tolerance_seconds": tolerance_seconds,
                 "session_filter": session_filter if use_regular else None,
             },
         )
     target_times = [row["timestamp"] for row in numeric_target]
     pairs = []
+    matched_times = []
     matched = 0
     for row in numeric_source:
         index = bisect.bisect_left(target_times, row["timestamp"])
@@ -134,6 +150,7 @@ def _align(
         distance = abs((target_times[best] - row["timestamp"]).total_seconds())
         if distance <= tolerance_seconds:
             pairs.append((float(row["return"]), float(numeric_target[best]["return"])))
+            matched_times.append(max(row["timestamp"], numeric_target[best]["timestamp"]))
             matched += 1
     return (
         pairs,
@@ -142,6 +159,10 @@ def _align(
             "matched": matched,
             "source_count": len(usable_source),
             "target_count": len(usable_target),
+            "latest_matched_time": (
+                max(matched_times).isoformat().replace("+00:00", "Z")
+                if matched_times else None
+            ),
             "tolerance_seconds": tolerance_seconds,
             "session_filter": session_filter if use_regular else None,
         },
@@ -158,17 +179,12 @@ def _timeframe_seconds(value: str) -> int:
     return {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}.get(value, 900)
 
 
-def _current_confirmation(source, target, pairs, timeframe):
+def _current_confirmation(source, target, pairs, alignment, timeframe):
     if not pairs or not source or not target:
         return {"status": "unavailable"}
-    timestamps = [
-        row.get("timestamp")
-        for row in [*source, *target]
-        if isinstance(row.get("timestamp"), datetime)
-    ]
-    if not timestamps:
+    latest = parse_datetime(alignment.get("latest_matched_time"))
+    if latest is None:
         return {"status": "historical_only"}
-    latest = max(timestamps)
     age = (datetime.now(timezone.utc) - latest).total_seconds()
     return {
         "status": "confirmed" if age <= _timeframe_seconds(timeframe) * 2 else "delayed",
@@ -227,7 +243,15 @@ def _residual_z(x, y):
     return (residuals[-1] - mean) / std if std else 0.0
 
 
-def _insufficient(count, reason, *, alignment=None, timeframe="15m"):
+def _insufficient(
+    count,
+    reason,
+    *,
+    alignment=None,
+    timeframe="15m",
+    overlap=0.0,
+    current_confirmation=None,
+):
     return {
         "rolling_corr_20": None,
         "rolling_corr_60": None,
@@ -239,14 +263,14 @@ def _insufficient(count, reason, *, alignment=None, timeframe="15m"):
         "residual_zscore": None,
         "relationship_stability": 0.0,
         "sample_count": count,
-        "session_overlap_ratio": 0.0,
+        "session_overlap_ratio": overlap,
         "usable": False,
         "state": "insufficient_data",
         "reason": reason,
         "alignment": alignment or {},
         "timeframe": timeframe,
         "historical_usable": False,
-        "current_confirmation": {"status": "unavailable"},
+        "current_confirmation": current_confirmation or {"status": "unavailable"},
     }
 
 

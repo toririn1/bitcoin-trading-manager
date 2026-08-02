@@ -56,6 +56,7 @@ class V2Settings:
     shadow_interval_seconds: int = 300
     minimum_calibration_samples: int = 30
     minimum_rr: float = 1.5
+    minimum_heuristic_score: float = 3.0
 
     @classmethod
     def from_env(cls) -> "V2Settings":
@@ -86,6 +87,7 @@ class V2Settings:
             ) or ("15m",),
             minimum_calibration_samples=_int("V2_MIN_CALIBRATION_SAMPLES", 30),
             minimum_rr=_float("V2_MIN_RR", 1.5),
+            minimum_heuristic_score=_float("V2_MIN_HEURISTIC_SCORE", 3.0),
         )
 
     def ensure_dirs(self, root: Path) -> None:
@@ -112,6 +114,7 @@ class V2Settings:
             "default_timeframes": list(self.default_timeframes),
             "minimum_calibration_samples": self.minimum_calibration_samples,
             "minimum_rr": self.minimum_rr,
+            "minimum_heuristic_score": self.minimum_heuristic_score,
         }
 
 
