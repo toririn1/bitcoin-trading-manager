@@ -2942,7 +2942,9 @@ a.status-chip { cursor: pointer; }
             <div class="macro-card" style="padding:8px;"><div class="card-label">Quality</div><div id="v2-quality" class="card-value" style="font-size:16px;">—</div></div>
             <div class="macro-card" style="padding:8px;"><div class="card-label">Candidates</div><div id="v2-candidate-count" class="card-value" style="font-size:16px;">—</div></div>
           </div>
-          <div class="card-label" style="margin:6px 0;">Opportunity ranking</div>
+          <div class="card-label" style="margin:6px 0;">Horizon matrix · deterministic V2</div>
+          <div id="v2-horizon-matrix" style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin-bottom:8px;font-size:10px;color:var(--text-dim);">—</div>
+          <div class="card-label" style="margin:6px 0;">Opportunity ranking · shadow eligible only</div>
           <div id="v2-ranking" style="font-size:11px;color:var(--text-dim);">—</div>
           <div id="v2-missing" style="font-size:10px;color:var(--text-muted);margin-top:8px;"></div>
         </div>
@@ -7864,6 +7866,8 @@ async function fetchV2Dashboard() {
     const healthRes = await fetch("/api/v2/data-health");
     if (!healthRes.ok) throw new Error("v2 health unavailable");
     const healthBody = await healthRes.json();
+    const horizonRes = await fetch("/api/v2/horizons");
+    const horizonBody = horizonRes.ok ? await horizonRes.json() : {data: []};
     const d = decisionBody.data || {};
     const health = healthBody.data || {};
     const candidates = Array.isArray(d.candidate_rank) ? d.candidate_rank : [];
@@ -7877,6 +7881,11 @@ async function fetchV2Dashboard() {
       missingFields.includes("snapshot_not_generated");
     const staleCandidates = Array.isArray(d.stale_candidates) ? d.stale_candidates : [];
     const currentCandidates = unavailable ? [] : candidates;
+    const opportunityCandidates = currentCandidates.filter(item =>
+      ["long", "short"].includes(String(item.direction || "")) &&
+      item.candidate_stage !== "diagnostic_candidate" &&
+      item.analysis_readiness !== false
+    );
     const staleCandidateCount = Number(d.stale_candidate_count ?? staleCandidates.length);
     const accountStatus = String(d.account_status || "unknown");
     const modeLabel = mode === "fixture" ? "FIXTURE / SYNTHETIC" :
@@ -7898,6 +7907,8 @@ async function fetchV2Dashboard() {
     qualityEl.textContent = Number.isFinite(quality) ? quality + "/100" : "N/A";
     qualityEl.style.color = quality >= 70 ? C.bull : quality >= 50 ? C.amber : C.bear;
     countEl.textContent = String(currentCandidates.length);
+    // Diagnostic/no-trade rows stay in the decision payload but not in the opportunity count.
+    countEl.textContent = String(opportunityCandidates.length);
 
     if (modeEl) {
       modeEl.textContent = modeLabel + (synthetic ? " · synthetic" : "");
@@ -7920,7 +7931,24 @@ async function fetchV2Dashboard() {
       action === "no_trade" ? "현재 비용·품질·guard를 통과한 진입 후보가 없습니다." :
       "V2 decision: " + action + " · heuristic setup / calibrated edge 상태를 확인하세요.";
 
-    document.getElementById("v2-ranking").innerHTML = currentCandidates.slice(0, 5).map((item, index) => {
+    const horizonRows = Array.isArray(horizonBody.data) ? horizonBody.data : [];
+    const horizonMap = {};
+    horizonRows.forEach(row => Object.assign(horizonMap, row.horizons || {}));
+    const horizonOrder = ["ultra_short", "short", "medium", "long"];
+    const horizonEl = document.getElementById("v2-horizon-matrix");
+    if (horizonEl) {
+      horizonEl.innerHTML = horizonOrder.map(key => {
+        const row = horizonMap[key] || {};
+        const ready = row.analysis_readiness === true;
+        const label = ready ? String(row.bias || "neutral").toUpperCase() : "과거 데이터 부족";
+        const regime = row.regime || "insufficient_data";
+        return '<div style="padding:6px;border:1px solid var(--border);border-radius:5px;"><div style="font-weight:700;color:var(--text-strong);">' +
+          escapeHtml(key) + '</div><div style="color:' + (ready ? C.teal : C.amber) + ';">' + escapeHtml(label) +
+          '</div><div>' + escapeHtml(String(regime)) + '</div></div>';
+      }).join("");
+    }
+
+    document.getElementById("v2-ranking").innerHTML = opportunityCandidates.slice(0, 5).map((item, index) => {
       const edge = item.net_edge_bps == null ? "edge N/A" :
         Number(item.net_edge_bps).toFixed(1) + " bps";
       const heuristic = item.heuristic_setup_score == null ? "heuristic N/A" :

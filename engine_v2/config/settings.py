@@ -27,6 +27,22 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+def _history_limits(value: str) -> tuple[tuple[str, int], ...]:
+    defaults = {"1m": 1500, "5m": 2000, "15m": 2000, "1h": 1500, "4h": 1000, "1d": 800, "1w": 250}
+    raw = _env("V2_HISTORY_LIMITS", value)
+    parsed = dict(defaults)
+    for item in raw.split(","):
+        if "=" not in item:
+            continue
+        timeframe, limit = (part.strip() for part in item.split("=", 1))
+        try:
+            if timeframe in defaults and int(limit) > 0:
+                parsed[timeframe] = int(limit)
+        except ValueError:
+            continue
+    return tuple(parsed.items())
+
+
 @dataclass(frozen=True, slots=True)
 class V2Settings:
     enabled: bool = True
@@ -46,7 +62,11 @@ class V2Settings:
     max_factor_positions: int = 2
     request_timeout_seconds: float = 8.0
     max_retries: int = 2
-    default_timeframes: tuple[str, ...] = ("5m", "15m", "1h", "4h", "1d")
+    default_timeframes: tuple[str, ...] = ("1m", "5m", "15m", "1h", "4h", "1d", "1w")
+    history_limits: tuple[tuple[str, int], ...] = (
+        ("1m", 1500), ("5m", 2000), ("15m", 2000), ("1h", 1500),
+        ("4h", 1000), ("1d", 800), ("1w", 250),
+    )
     lead_lag_bars: int = 6
     minimum_sample_count: int = 30
     minimum_overlap_ratio: float = 0.6
@@ -82,9 +102,10 @@ class V2Settings:
             replay_time=_env("V2_REPLAY_TIME", "") or None,
             shadow_interval_seconds=_int("V2_SHADOW_INTERVAL_SECONDS", 300),
             default_timeframes=tuple(
-                item.strip() for item in _env("V2_TIMEFRAMES", "5m,15m,1h,4h,1d").split(",")
+                item.strip() for item in _env("V2_TIMEFRAMES", "1m,5m,15m,1h,4h,1d,1w").split(",")
                 if item.strip()
             ) or ("15m",),
+            history_limits=_history_limits("1m=1500,5m=2000,15m=2000,1h=1500,4h=1000,1d=800,1w=250"),
             minimum_calibration_samples=_int("V2_MIN_CALIBRATION_SAMPLES", 30),
             minimum_rr=_float("V2_MIN_RR", 1.5),
             minimum_heuristic_score=_float("V2_MIN_HEURISTIC_SCORE", 3.0),
@@ -112,6 +133,7 @@ class V2Settings:
             "minimum_sample_count": self.minimum_sample_count,
             "minimum_overlap_ratio": self.minimum_overlap_ratio,
             "default_timeframes": list(self.default_timeframes),
+            "history_limits": {key: value for key, value in self.history_limits},
             "minimum_calibration_samples": self.minimum_calibration_samples,
             "minimum_rr": self.minimum_rr,
             "minimum_heuristic_score": self.minimum_heuristic_score,

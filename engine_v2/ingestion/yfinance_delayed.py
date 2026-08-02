@@ -77,8 +77,13 @@ class YFinanceDelayedProvider(MarketDataProvider):
                     "asset_class": item["asset_class"].value,
                     "delay_label": "delayed",
                     "source_symbol": item["symbol"],
+                    "underlying_session": item["timezone"],
                 },
                 discovered_at=datetime.now(timezone.utc),
+                contract_type="leveraged_etf_underlying" if underlying == "SOXL" else "reference",
+                underlying_reference=underlying,
+                underlying_session=item["timezone"],
+                settlement_asset="USD" if underlying not in {"SK_HYNIX_KRX", "SAMSUNG_KRX", "KOSPI", "KOSDAQ", "USD_KRW"} else "KRW",
             ))
         return ProviderResult(self.name, products=products, quality=DataQuality.DELAYED, reason="delayed_market_catalog", request_count=0)
 
@@ -158,7 +163,7 @@ class YFinanceDelayedProvider(MarketDataProvider):
 def _history(symbol: str, timeframe: str, limit: int, timeout: float) -> list[dict[str, Any]]:
     import yfinance as yf
 
-    interval = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "1h", "1d": "1d"}.get(timeframe)
+    interval = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "1h", "1d": "1d", "1w": "1wk"}.get(timeframe)
     if interval is None:
         raise ValueError(f"unsupported_timeframe:{timeframe}")
     period = "60d" if interval in {"1m", "5m", "15m"} else "730d" if interval == "1h" else "5y"
@@ -204,7 +209,7 @@ def _session(value: datetime, timezone_name: str) -> str:
 
 
 def _interval_seconds(timeframe: str) -> int:
-    return {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}.get(timeframe, 900)
+    return {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800}.get(timeframe, 900)
 
 
 def _number(value: Any) -> float | None:

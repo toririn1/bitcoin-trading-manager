@@ -14,6 +14,7 @@ from engine_v2.events import classify, deduplicate, normalize_event
 from engine_v2.features import (
     aggregate_quality,
     actual_delta_surface,
+    analyze_horizons,
     classify_regime,
     closed_candle_features,
     factor_state,
@@ -84,6 +85,7 @@ class V2Engine:
         self.storage.close()
 
     def status(self) -> dict[str, Any]:
+        products = list(self.registry.products.values())
         return {
             "engine": "v2",
             "enabled": self.settings.enabled,
@@ -93,7 +95,15 @@ class V2Engine:
             "legacy_debate_enabled": self.settings.legacy_debate_enabled,
             "storage": self.storage.status(),
             "provider_count": len(self.manager.providers),
-            "registered_products": len(self.registry.products),
+            "registered_products": len(products),
+            "base_registry_count": sum(1 for item in products if item.discovery_payload_hash is None),
+            "discovered_product_count": sum(1 for item in products if item.discovery_payload_hash is not None),
+            "tradable_product_count": sum(1 for item in products if item.role == "tradable" and item.is_tradable),
+            "reference_product_count": sum(1 for item in products if item.role == "reference" or not item.is_tradable),
+            "product_counts_by_contract_type": {
+                key: sum(1 for item in products if item.contract_type == key)
+                for key in sorted({item.contract_type or "unknown" for item in products})
+            },
         }
 
     async def discover(self) -> dict[str, Any]:
@@ -124,6 +134,8 @@ class V2Engine:
         if selected_mode == "fixture":
             self.storage.append_observations(raw_observations)
         records = [_record(observation) for observation in raw_observations]
+        if selected_mode == "live":
+            records = _merge_records(records, self._stored_history_records(decision_time))
         account = await asyncio.to_thread(read_account_overlay) if selected_mode == "live" else {
             "status": "not_loaded",
             "positions": None,
@@ -139,20 +151,50 @@ class V2Engine:
 
     async def _live_observations(self) -> list[Any]:
         await self.manager.discover(TARGET_UNDERLYINGS)
-        limit = int(os.getenv("V2_LIVE_LIMIT", "120"))
-        products = list(self.registry.tradable_products())
-        timeframes = self.settings.default_timeframes
-        results = await asyncio.gather(*(
-            self.manager.backfill(product.product_id, timeframe=timeframe, limit=limit)
+        limits = dict(self.settings.history_limits)
+        live_limit = os.getenv("V2_LIVE_LIMIT")
+        if live_limit:
+            try:
+                override = max(1, int(live_limit))
+                limits = {key: min(value, override) for key, value in limits.items()}
+            except ValueError:
+                pass
+        selected_underlyings = {
+            item.strip().upper()
+            for item in os.getenv(
+                "V2_HISTORY_UNDERLYINGS",
+                "BTC,QQQ,SOXX,SOXL,NVDA,MU,SK_HYNIX_KRX,USD_KRW",
+            ).split(",")
+            if item.strip()
+        }
+        products = [
+            product for product in self.registry.products.values()
+            if (
+                product.underlying_id.upper() in selected_underlyings
+                and (
+                    product.role == "tradable"
+                    or product.provider == "yfinance_delayed"
+                )
+            )
+        ]
+        timeframes = [timeframe for timeframe in self.settings.default_timeframes if timeframe in limits]
+        tasks = [
+            self.manager.backfill_history(
+                product.product_id,
+                timeframe=timeframe,
+                requested=limits[timeframe],
+                minimum_closed=self.settings.minimum_sample_count,
+            )
             for product in products
             for timeframe in timeframes
-        ))
+        ]
+        results = await asyncio.gather(*tasks) if tasks else []
         observations = [observation for result in results for observation in result.data]
         if os.getenv("COINGLASS_ENABLED", "").lower() in {"1", "true", "yes"} and os.getenv("COINGLASS_API_KEY"):
             btc = self.registry.product("BTC_BINANCE_PERP")
             provider = self.manager.providers.get("coinglass")
             if btc is not None and provider is not None:
-                result = await provider.backfill(btc, timeframe="15m", limit=limit)
+                result = await provider.backfill(btc, timeframe="15m", limit=limits.get("15m", 300))
                 self.storage.append_observations(result.data)
                 observations.extend(result.data)
 
@@ -189,6 +231,52 @@ class V2Engine:
                     for observation in result.data
                 )
         return observations
+
+    def _stored_history_records(self, decision_time: datetime) -> list[dict[str, Any]]:
+        selected_underlyings = {
+            item.strip().upper()
+            for item in os.getenv(
+                "V2_HISTORY_UNDERLYINGS",
+                "BTC,QQQ,SOXX,SOXL,NVDA,MU,SK_HYNIX_KRX,USD_KRW",
+            ).split(",")
+            if item.strip()
+        }
+        limits = dict(self.settings.history_limits)
+        output: list[dict[str, Any]] = []
+        for product in self.registry.products.values():
+            if product.underlying_id.upper() not in selected_underlyings:
+                continue
+            if product.role != "tradable" and product.provider != "yfinance_delayed":
+                continue
+            for timeframe in self.settings.default_timeframes:
+                requested = limits.get(timeframe, 300)
+                for payload in self.storage.candle_history(
+                    product.product_id,
+                    timeframe,
+                    limit=requested,
+                    decision_time=decision_time,
+                ):
+                    if str(payload.get("provider") or payload.get("source") or "") == "fixture":
+                        continue
+                    event_time = payload.get("open_time")
+                    output.append({
+                        "observation_id": f"stored-{product.product_id}-{timeframe}-{event_time}",
+                        "provider": payload.get("provider") or product.provider,
+                        "venue": payload.get("venue") or product.venue,
+                        "product_id": product.product_id,
+                        "data_type": f"candle_{timeframe}",
+                        "source_event_time": event_time,
+                        "source_publish_time": None,
+                        "first_seen_at": payload.get("collected_at") or event_time,
+                        "collected_at": payload.get("collected_at") or event_time,
+                        "available_at": payload.get("available_at") or event_time,
+                        "processed_at": None,
+                        "quality": payload.get("quality") or "ok",
+                        "schema_version": "2.0",
+                        "reason": payload.get("storage_reason"),
+                        "payload": payload,
+                    })
+        return output
 
     def _assemble_snapshot(
         self,
@@ -278,6 +366,30 @@ class V2Engine:
             context["underlying_close_age"] = underlying_age
             context["usd_krw_age"] = usd_krw_age
         global_quality = _quality(records, mode)
+        readiness_by_product = {}
+        for product_id, state in product_snapshots.items():
+            horizons = state.get("features", {}).get("horizons", {})
+            readiness_by_product[product_id] = {
+                horizon: {
+                    "analysis_readiness": value.get("analysis_readiness", False),
+                    "closed_counts": value.get("closed_counts", {}),
+                    "context_timeframe": value.get("context_timeframe"),
+                    "setup_timeframe": value.get("setup_timeframe"),
+                    "trigger_timeframe": value.get("trigger_timeframe"),
+                }
+                for horizon, value in horizons.items()
+            }
+        readiness_values = [
+            value.get("analysis_readiness")
+            for state in product_snapshots.values()
+            for value in (state.get("features", {}).get("horizons", {}) or {}).values()
+        ]
+        global_quality.update({
+            "ingestion_quality": global_quality.get("quality"),
+            "history_quality": "ready" if records else "data_unavailable",
+            "analysis_readiness": "ready" if readiness_values and any(readiness_values) else "insufficient_data",
+            "execution_readiness": "read_only_shadow_only",
+        })
         factors = factor_state(latest_return_by_underlying)
         positions = account.get("positions")
         portfolio = portfolio_concentration(
@@ -297,6 +409,7 @@ class V2Engine:
             base = {
                 "mode": mode,
                 "features": state["features"],
+                "horizons": state["features"].get("horizons", {}),
                 "data_quality": state["data_quality"],
                 "costs": state["costs"],
                 "product_context": state["product_context"],
@@ -349,6 +462,7 @@ class V2Engine:
         snapshot["mode"] = mode
         snapshot["synthetic"] = mode == "fixture"
         snapshot["data_unavailable"] = data_unavailable
+        snapshot["history_readiness"] = readiness_by_product
         snapshot["current_candidate_count"] = len(snapshot["ranked_candidates"])
         snapshot["stale_candidates"] = stale_candidates
         snapshot["stale_candidate_count"] = len(stale_candidates)
@@ -444,6 +558,8 @@ class V2Engine:
             "product_risk": 0,
             "portfolio_fit": 0,
             "technical": technical,
+            "horizons": technical.get("horizons", {}),
+            "analysis_readiness": technical.get("analysis_readiness", False),
             "microstructure": {"trade_cvd": cvd, "orderbook": orderbook},
             "derivatives_state": derivatives,
             "cross_asset_state": {},
@@ -556,6 +672,10 @@ class V2Engine:
                 "quality": "data_unavailable",
                 "score": 0,
                 "missing": ["snapshot_not_generated"],
+                "ingestion_quality": "data_unavailable",
+                "history_quality": "snapshot_not_generated",
+                "analysis_readiness": "insufficient_data",
+                "execution_readiness": "read_only_shadow_only",
             },
         }
 
@@ -575,6 +695,20 @@ class V2Engine:
         ]
 
 
+def _merge_records(current: list[dict[str, Any]], stored: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for record in [*stored, *current]:
+        payload = record.get("payload") or {}
+        key = (
+            str(record.get("product_id") or ""),
+            str(record.get("data_type") or ""),
+            str(payload.get("open_time") or record.get("source_event_time") or record.get("observation_id") or ""),
+        )
+        existing = merged.get(key)
+        if existing is None or record in current:
+            merged[key] = record
+    return list(merged.values())
+
 def _record(value: Any) -> dict[str, Any]:
     return value.to_dict() if hasattr(value, "to_dict") else dict(value)
 
@@ -587,14 +721,23 @@ def _technical(records: list[dict[str, Any]], minimum: int) -> dict[str, Any]:
             continue
         timeframe = data_type.removeprefix("candle_")
         by_timeframe[timeframe].append(record.get("payload") or {})
-    # The decision timeframe is explicit and never silently mixes 5m/15m/1h.
-    selected = by_timeframe.get("15m")
-    if not selected:
-        selected = next(
-            (by_timeframe[key] for key in ("5m", "1h", "4h", "1d") if by_timeframe.get(key)),
-            [],
-        )
-    return closed_candle_features(selected, minimum_samples=min(30, minimum))
+    selected = by_timeframe.get("15m") or next(
+        (by_timeframe[key] for key in ("5m", "1h", "4h", "1d", "1w") if by_timeframe.get(key)),
+        [],
+    )
+    base = closed_candle_features(selected, minimum_samples=min(30, minimum))
+    horizons = analyze_horizons(by_timeframe, minimum_samples=min(30, minimum))
+    ready = all(item.get("analysis_readiness") for item in horizons.values())
+    base["horizons"] = horizons
+    base["analysis_readiness"] = ready
+    base["regime"] = {
+        "state": next(
+            (item.get("regime") for item in horizons.values() if item.get("analysis_readiness")),
+            "insufficient_data",
+        ),
+        "horizons": {key: value.get("regime") for key, value in horizons.items()},
+    }
+    return base
 
 
 def _quality(records: list[dict[str, Any]], mode: str) -> dict[str, Any]:

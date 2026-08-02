@@ -17,8 +17,10 @@ def scan_opportunities(products: Iterable[dict[str, Any]], snapshot: dict[str, A
         if product.get("short_supported") and product.get("product_type") != "spot":
             directions.append(Direction.SHORT)
         directions.append(Direction.NO_TRADE)
-        for direction in directions:
-            candidates.append(score_candidate(product, direction, snapshot, min_net_edge_bps=min_net_edge_bps))
+        horizons = list((snapshot.get("horizons") or {}).keys()) or ["intraday"]
+        for horizon in horizons:
+            for direction in directions:
+                candidates.append(score_candidate(product, direction, snapshot, min_net_edge_bps=min_net_edge_bps, horizon_name=horizon))
     return rank_candidates(candidates)
 
 

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from uuid import uuid4
 
-from engine_v2.domain.models import Observation, to_dict
+from engine_v2.domain.models import Observation, parse_datetime, to_dict
 
 
 class V2Storage:
@@ -312,6 +312,112 @@ class V2Storage:
             row["payload"] = json.loads(row.pop("payload_json"))
         return rows
 
+    def candle_history(
+        self,
+        product_id: str,
+        timeframe: str,
+        *,
+        limit: int = 2000,
+        decision_time: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return unique candle payloads in chronological order.
+
+        The payload with the same product/timeframe/open_time is represented once;
+        a final candle supersedes a previously stored forming candle.
+        """
+        clauses = ["product_id = ?", "data_type = ?"]
+        params: list[Any] = [product_id, f"candle_{timeframe}"]
+        if decision_time is not None:
+            clauses.append("available_at IS NOT NULL AND available_at <= ?")
+            params.append(self._timestamp(decision_time))
+        rows = self._rows(self._db.execute(
+            "SELECT source_event_time, collected_at, quality, reason, payload_json "
+            "FROM observations WHERE " + " AND ".join(clauses) +
+            " ORDER BY COALESCE(source_event_time, collected_at) ASC",
+            params,
+        ))
+        by_open: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            payload = json.loads(row.pop("payload_json"))
+            key = str(payload.get("open_time") or row.get("source_event_time") or "")
+            if not key:
+                continue
+            current = by_open.get(key)
+            if current is None or bool(payload.get("is_final")) and not bool(current.get("is_final")):
+                payload.setdefault("quality", row.get("quality"))
+                payload.setdefault("storage_reason", row.get("reason"))
+                by_open[key] = payload
+        values = list(by_open.values())
+        values.sort(key=lambda item: str(item.get("open_time") or ""))
+        return values[-max(1, int(limit)):]
+
+    def history_readiness(
+        self,
+        product_id: str,
+        timeframe: str,
+        *,
+        requested: int,
+        minimum_closed: int = 30,
+        decision_time: datetime | None = None,
+    ) -> dict[str, Any]:
+        rows = self.candle_history(
+            product_id,
+            timeframe,
+            limit=max(requested * 2, requested + 10, 5000),
+            decision_time=decision_time,
+        )
+        closed = [row for row in rows if row.get("is_final") is True]
+        forming = [row for row in rows if row.get("is_final") is False]
+        timestamps = []
+        for row in closed:
+            value = parse_datetime(row.get("open_time"))
+            if value:
+                timestamps.append(value)
+        timestamps.sort()
+        interval_seconds = {
+            "1m": 60, "5m": 300, "15m": 900, "1h": 3600,
+            "4h": 14400, "1d": 86400, "1w": 604800,
+        }.get(timeframe)
+        gap_count = 0
+        if interval_seconds and len(timestamps) > 1:
+            for previous, current in zip(timestamps, timestamps[1:]):
+                delta = (current - previous).total_seconds()
+                if delta > interval_seconds * 1.5:
+                    gap_count += max(0, int(round(delta / interval_seconds)) - 1)
+        return {
+            "product_id": product_id,
+            "timeframe": timeframe,
+            "requested_samples": requested,
+            "closed_count": len(closed),
+            "forming_count": len(forming),
+            "first_closed_at": timestamps[0].isoformat().replace("+00:00", "Z") if timestamps else None,
+            "last_closed_at": timestamps[-1].isoformat().replace("+00:00", "Z") if timestamps else None,
+            "gap_count": gap_count,
+            "duplicate_count": max(0, len(rows) - len({str(row.get("open_time")) for row in rows})),
+            "readiness": "ready" if len(closed) >= max(minimum_closed, requested) else "insufficient_data",
+            "analysis_ready": len(closed) >= max(minimum_closed, requested),
+        }
+
+    def history_summary(
+        self,
+        products: Iterable[Any],
+        limits: dict[str, int],
+        *,
+        minimum_closed: int = 30,
+        decision_time: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        output = []
+        for product in products:
+            for timeframe, requested in limits.items():
+                output.append(self.history_readiness(
+                    product.product_id if hasattr(product, "product_id") else str(product.get("product_id")),
+                    timeframe,
+                    requested=requested,
+                    minimum_closed=minimum_closed,
+                    decision_time=decision_time,
+                ))
+        return output
+
     def save_features(self, snapshot_id: str, values: Iterable[dict[str, Any]]) -> None:
         params = []
         for value in values:
@@ -366,7 +472,7 @@ class V2Storage:
             ))
         for candidate in candidates:
             status = str(candidate.get("candidate_status") or "")
-            if not status.startswith(("research_only_", "actionable_")):
+            if not status.startswith(("research_only_", "actionable_", "shadow_eligible_")):
                 continue
             if not candidate.get("valid_for_shadow"):
                 continue

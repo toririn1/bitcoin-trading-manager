@@ -118,11 +118,29 @@ class ProductSpec:
     maker_fee_bps: float | None = None
     taker_fee_bps: float | None = None
     estimated_slippage_bps: float | None = None
+    contract_type: str | None = None
+    delivery_time: datetime | None = None
+    expiry: datetime | None = None
+    settlement_asset: str | None = None
+    underlying_reference: str | None = None
+    underlying_session: str | None = None
+    discovery_payload_hash: str | None = None
 
     def __post_init__(self) -> None:
         self.discovered_at = ensure_utc(self.discovered_at)
         if not self.product_id or not self.underlying_id or not self.venue_symbol:
             raise ValueError("product_id, underlying_id, and venue_symbol are required")
+        self.delivery_time = ensure_utc(self.delivery_time)
+        self.expiry = ensure_utc(self.expiry)
+        self.contract_type = self.contract_type or {
+            ProductType.SPOT: "spot",
+            ProductType.PERPETUAL: "perpetual",
+            ProductType.FUTURE: "dated_future",
+            ProductType.OPTION: "option",
+            ProductType.CFD: "cfd",
+        }.get(self.product_type, "unknown")
+        self.settlement_asset = self.settlement_asset or self.settlement_currency
+        self.underlying_reference = self.underlying_reference or self.underlying_id
         self.role = self.role or ("tradable" if self.is_tradable else "reference")
         if self.role not in {"tradable", "reference"}:
             raise ValueError("ProductSpec.role must be tradable or reference")
@@ -349,6 +367,24 @@ class OpportunityCandidate:
     invalidation_reason: str | None = None
     execution_permission: str = "data_unavailable"
     calibration_group: dict[str, Any] = field(default_factory=dict)
+    strategy_family: str = "unknown"
+    regime: str | None = None
+    context_timeframe: str | None = None
+    setup_timeframe: str | None = None
+    trigger_timeframe: str | None = None
+    trigger_condition: str | None = None
+    entry_zone: dict[str, float] | None = None
+    expiry: datetime | None = None
+    risk_reward: float | None = None
+    structure_score: float | None = None
+    trend_score: float | None = None
+    volatility_score: float | None = None
+    level_score: float | None = None
+    orderflow_confirmation: str | None = None
+    regime_compatibility: str | None = None
+    analysis_readiness: bool = False
+    failure_conditions: list[str] = field(default_factory=list)
+    candidate_stage: str = "diagnostic_candidate"
 
     def to_dict(self) -> dict[str, Any]:
         return to_dict(asdict(self))

@@ -9,10 +9,11 @@ from engine_v2.domain.models import Candle, Observation, ProductSpec, TradeExecu
 
 from .base import MarketDataProvider, ProviderCapabilities, ProviderResult
 from .http import AsyncJSONClient
+from .metadata import canonical_product_id, classify_contract, payload_hash
 
 
 BYBIT_API = "https://api.bybit.com"
-BYBIT_INTERVALS = {"1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D"}
+BYBIT_INTERVALS = {"1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D", "1w": "W"}
 
 
 class BybitPublicProvider(MarketDataProvider):
@@ -50,7 +51,12 @@ class BybitPublicProvider(MarketDataProvider):
                 continue
             lot = item.get("lotSizeFilter") or {}
             price = item.get("priceFilter") or {}
-            products.append(ProductSpec(f"{base}_BYBIT_PERP", base, self.name, "bybit_linear", symbol, ProductType.PERPETUAL, quote_currency=item.get("quoteCoin"), settlement_currency=item.get("settleCoin"), contract_size=_number(item.get("contractSize")), tick_size=_number(price.get("tickSize")), lot_size=_number(lot.get("qtyStep")), min_order_size=_number(lot.get("minOrderQty")), max_leverage=_number((item.get("leverageFilter") or {}).get("maxLeverage")), funding_supported=True, short_supported=True, price_source="bybit_public", is_tradable=True, capabilities={"instrument": item}, discovered_at=datetime.now(timezone.utc)))
+            contract_type, expiry = classify_contract(item, product_type=ProductType.PERPETUAL)
+            if contract_type != "perpetual":
+                # Dated/unknown products must not masquerade as perpetuals.
+                product_type = ProductType.FUTURE if contract_type == "dated_future" else ProductType.PERPETUAL
+            product_id = canonical_product_id(base, "BYBIT", contract_type, expiry)
+            products.append(ProductSpec(product_id, base, self.name, "bybit_linear", symbol, product_type, quote_currency=item.get("quoteCoin"), settlement_currency=item.get("settleCoin"), contract_size=_number(item.get("contractSize")), tick_size=_number(price.get("tickSize")), lot_size=_number(lot.get("qtyStep")), min_order_size=_number(lot.get("minOrderQty")), max_leverage=_number((item.get("leverageFilter") or {}).get("maxLeverage")), funding_supported=contract_type == "perpetual", short_supported=contract_type in {"perpetual", "dated_future"}, price_source="bybit_public", is_tradable=contract_type in {"perpetual", "dated_future"}, role="tradable" if contract_type in {"perpetual", "dated_future"} else "reference", capabilities={"instrument": item}, discovered_at=datetime.now(timezone.utc), contract_type=contract_type, expiry=expiry, delivery_time=expiry, settlement_asset=item.get("settleCoin"), underlying_reference=base, discovery_payload_hash=payload_hash(item)))
         return ProviderResult(self.name, products=products, request_count=1)
 
     async def backfill(self, product: ProductSpec, *, timeframe: str = "15m", limit: int = 300) -> ProviderResult:
@@ -103,4 +109,4 @@ def _number(value: Any) -> float | None:
 
 
 def _interval_seconds(timeframe: str) -> int:
-    return {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}.get(timeframe, 900)
+    return {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800}.get(timeframe, 900)

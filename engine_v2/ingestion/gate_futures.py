@@ -9,6 +9,7 @@ from engine_v2.domain.models import Candle, Observation, ProductSpec
 
 from .base import MarketDataProvider, ProviderCapabilities, ProviderResult
 from .http import AsyncJSONClient
+from .metadata import canonical_product_id, classify_contract, payload_hash
 
 
 GATE_API = "https://api.gateio.ws/api/v4"
@@ -45,11 +46,16 @@ class GateFuturesProvider(MarketDataProvider):
             base = _base_asset(contract)
             if not contract or not base or (underlying_ids and base not in underlying_ids):
                 continue
-            products.append(ProductSpec(f"{base}_GATE_PERP", base, self.name, f"gate_{self.settle}_futures", contract, ProductType.PERPETUAL, quote_currency=self.settle.upper(), settlement_currency=self.settle.upper(), contract_size=_number(item.get("quanto_multiplier")) if isinstance(item, dict) else None, tick_size=_number(item.get("order_price_round")) if isinstance(item, dict) else None, min_order_size=_number(item.get("order_size_min")) if isinstance(item, dict) else None, max_leverage=_number(item.get("leverage_max")) if isinstance(item, dict) else None, funding_supported=True, short_supported=True, price_source="gate_futures_public", is_tradable=True, capabilities={"contract": item}, discovered_at=datetime.now(timezone.utc)))
+            item = item if isinstance(item, dict) else {}
+            contract_type, expiry = classify_contract(item, product_type=ProductType.PERPETUAL)
+            product_type = ProductType.FUTURE if contract_type == "dated_future" else ProductType.PERPETUAL
+            product_id = canonical_product_id(base, "GATE", contract_type, expiry)
+            tradable = contract_type in {"perpetual", "dated_future"}
+            products.append(ProductSpec(product_id, base, self.name, f"gate_{self.settle}_futures", contract, product_type, quote_currency=self.settle.upper(), settlement_currency=self.settle.upper(), contract_size=_number(item.get("quanto_multiplier")), tick_size=_number(item.get("order_price_round")), min_order_size=_number(item.get("order_size_min")), max_leverage=_number(item.get("leverage_max")), funding_supported=contract_type == "perpetual", short_supported=tradable, price_source="gate_futures_public", is_tradable=tradable, role="tradable" if tradable else "reference", capabilities={"contract": item}, discovered_at=datetime.now(timezone.utc), contract_type=contract_type, expiry=expiry, delivery_time=expiry, settlement_asset=self.settle.upper(), underlying_reference=base, discovery_payload_hash=payload_hash(item)))
         return ProviderResult(self.name, products=products, request_count=1)
 
     async def backfill(self, product: ProductSpec, *, timeframe: str = "15m", limit: int = 300) -> ProviderResult:
-        interval = {"1m": "10s", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}.get(timeframe)
+        interval = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d", "1w": "7d"}.get(timeframe)
         if not interval:
             return ProviderResult(self.name, quality=DataQuality.UNSUPPORTED, reason=f"unsupported_timeframe:{timeframe}")
         now = datetime.now(timezone.utc)
@@ -83,7 +89,7 @@ def _number(value: Any) -> float | None:
 
 
 def _interval_seconds(timeframe: str) -> int:
-    return {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}.get(timeframe, 900)
+    return {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800}.get(timeframe, 900)
 
 
 def _dt_epoch(value: Any) -> datetime | None:

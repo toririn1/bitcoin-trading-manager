@@ -63,6 +63,10 @@ class Horizon(str, Enum):
     INTRADAY = "intraday"
     SWING = "swing"
     POSITION = "position"
+    ULTRA_SHORT = "ultra_short"
+    SHORT = "short"
+    MEDIUM = "medium"
+    LONG = "long"
 
 
 class EventStatus(str, Enum):

@@ -17,9 +17,13 @@ def score_candidate(
     snapshot: dict[str, Any],
     *,
     min_net_edge_bps: float = 8.0,
+    horizon_name: str = "intraday",
 ) -> OpportunityCandidate:
     features = snapshot.get("features", {})
     quality = snapshot.get("data_quality", {})
+    horizon_analysis = (snapshot.get("horizons") or {}).get(horizon_name) or {}
+    analysis_ready = bool(horizon_analysis.get("analysis_readiness", True))
+    regime = str(horizon_analysis.get("regime") or (features.get("regime") or {}).get("state") or "unknown")
     direction_sign = 1 if direction == Direction.LONG else -1 if direction == Direction.SHORT else 0
     trend = _score(features.get("technical_structure"), 20, direction_sign)
     momentum = _score(features.get("momentum"), 10, direction_sign)
@@ -42,7 +46,7 @@ def score_candidate(
     edge_quality = str(calibrated.get("status") or ("calibrated" if edge is not None else "uncalibrated"))
 
     created_at = datetime.now(timezone.utc)
-    entry = _entry_plan(product, direction, features, created_at, snapshot)
+    entry = _entry_plan(product, direction, features, created_at, snapshot, horizon_name=horizon_name, horizon_analysis=horizon_analysis)
     reasons: list[str] = ["no_trade_candidate"] if direction == Direction.NO_TRADE else []
     risks = list(guard.get("warnings", [])) + list(guard.get("reasons", []))
     gate_reasons: list[str] = []
@@ -55,6 +59,8 @@ def score_candidate(
             gate_reasons.append("trigger_missing")
         if quality_score < 55:
             gate_reasons.append("data_quality_gate")
+        if not analysis_ready:
+            gate_reasons.append("analysis_readiness_gate")
         if snapshot.get("mode") == "fixture":
             reasons.append("fixture_synthetic")
         if not guard.get("allowed", True):
@@ -91,19 +97,24 @@ def score_candidate(
             if not gate_reasons
             else f"research_only_{direction.value}"
         )
-        valid_for_shadow = quality_score >= 55 and heuristic >= heuristic_threshold
+        valid_for_shadow = quality_score >= 55 and heuristic >= heuristic_threshold and analysis_ready
         valid_for_user_execution = not gate_reasons
         permission = "manual_confirmation_required" if valid_for_user_execution else "shadow_only"
         plan = entry["entry_plan"]
         setup_quality = "actionable" if valid_for_user_execution else "research"
 
     invalidation_reason = _invalidation_reason(unique_reasons, entry)
+    candidate_stage = (
+        "user_actionable_candidate" if valid_for_user_execution
+        else "shadow_eligible_candidate" if valid_for_shadow
+        else "diagnostic_candidate"
+    )
     return OpportunityCandidate(
         candidate_id=f"v2-{uuid4().hex[:12]}",
         created_at=created_at,
         product_id=str(product.get("product_id")),
         direction=direction,
-        horizon=Horizon.INTRADAY,
+        horizon=_horizon_value(horizon_name),
         entry_plan=plan,
         invalidation=invalidation_reason,
         targets=[entry["target_price"]] if entry["target_price"] is not None else [],
@@ -145,9 +156,27 @@ def score_candidate(
             "product_id": product.get("product_id"),
             "direction": direction.value,
             "setup": entry["setup_type"],
-            "horizon": Horizon.INTRADAY.value,
-            "regime": (features.get("regime") or {}).get("state") or "unknown",
+            "horizon": horizon_name,
+            "regime": regime,
         },
+        strategy_family=entry["strategy_family"],
+        regime=regime,
+        context_timeframe=entry["context_timeframe"],
+        setup_timeframe=entry["setup_timeframe"],
+        trigger_timeframe=entry["trigger_timeframe"],
+        trigger_condition=entry["trigger_condition"],
+        entry_zone=entry["entry_zone"],
+        expiry=entry["time_expiry"],
+        risk_reward=entry["risk_reward"],
+        structure_score=entry["structure_score"],
+        trend_score=trend,
+        volatility_score=entry["volatility_score"],
+        level_score=entry["level_score"],
+        orderflow_confirmation=entry["orderflow_confirmation"],
+        regime_compatibility=entry["regime_compatibility"],
+        analysis_readiness=analysis_ready,
+        failure_conditions=entry["failure_conditions"],
+        candidate_stage=candidate_stage,
     )
 
 
@@ -157,61 +186,119 @@ def _entry_plan(
     features: dict[str, Any],
     created_at: datetime,
     snapshot: dict[str, Any],
+    *,
+    horizon_name: str = "intraday",
+    horizon_analysis: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if direction == Direction.NO_TRADE:
         return {
             "entry_plan": EntryPlan.NO_ENTRY,
             "setup_type": "no_trade",
+            "strategy_family": "no_trade",
             "trigger_price": None,
             "stop_price": None,
             "target_price": None,
             "time_expiry": None,
             "risk_reward": None,
+            "trigger_condition": None,
+            "entry_zone": None,
+            "context_timeframe": None,
+            "setup_timeframe": None,
+            "trigger_timeframe": None,
+            "structure_score": None,
+            "volatility_score": None,
+            "level_score": None,
+            "orderflow_confirmation": None,
+            "regime_compatibility": "not_applicable",
+            "failure_conditions": [],
         }
-    technical = features.get("technical") or {}
+    analysis = horizon_analysis or {}
+    technical = {**(features.get("technical") or {}), **(analysis.get("technical") or {})}
+    structure = analysis.get("structure") or technical.get("structure") or {}
     latest = _number(technical.get("latest_close")) or _number(features.get("latest_close"))
     if latest is None or latest <= 0:
         return {
             "entry_plan": EntryPlan.NO_ENTRY,
             "setup_type": "no_entry",
+            "strategy_family": "no_trade",
             "trigger_price": None,
             "stop_price": None,
             "target_price": None,
             "time_expiry": None,
             "risk_reward": None,
+            "trigger_condition": None,
+            "entry_zone": None,
+            "context_timeframe": analysis.get("context_timeframe"),
+            "setup_timeframe": analysis.get("setup_timeframe"),
+            "trigger_timeframe": analysis.get("trigger_timeframe"),
+            "structure_score": 0.0,
+            "volatility_score": 0.0,
+            "level_score": 0.0,
+            "orderflow_confirmation": "missing",
+            "regime_compatibility": "insufficient_data",
+            "failure_conditions": ["latest_close_missing"],
         }
     sign = 1 if direction == Direction.LONG else -1
     atr_pct = _number(technical.get("atr_14_pct_closed"))
     atr = latest * (atr_pct if atr_pct and atr_pct > 0 else 0.005)
-    return_4 = _number(technical.get("return_4")) or 0.0
-    return_24 = _number(technical.get("return_24")) or 0.0
-    trend = str(technical.get("trend_state") or "")
-    aligned = (direction == Direction.LONG and trend == "bullish") or (direction == Direction.SHORT and trend == "bearish")
-    if aligned and abs(return_24) >= 0.003:
-        setup_type = "breakout"
-        plan = EntryPlan.BREAKOUT_CONFIRMATION
-        trigger = latest + sign * max(atr * 0.10, latest * 0.0005)
-    elif return_4 * sign < 0:
-        setup_type = "pullback"
-        plan = EntryPlan.LIMIT_PULLBACK
-        trigger = latest - sign * max(atr * 0.10, latest * 0.0005)
-    else:
-        setup_type = "retest"
-        plan = EntryPlan.RETEST
+    regime = str(analysis.get("regime") or "range")
+    failed_breakout = bool(structure.get("failed_breakout") or structure.get("sweep_reclaim"))
+    strong_trend = regime in {"trend_up", "trend_down"} and abs(_number(technical.get("adx_14")) or 0) >= 20
+    if failed_breakout and not strong_trend:
+        strategy_family = "countertrend_long" if direction == Direction.LONG else "countertrend_short"
+        setup_type = "liquidity_sweep_reclaim" if structure.get("sweep_reclaim") else "failed_breakout_reversion"
+        plan = EntryPlan.CONDITIONAL_TRIGGER
         trigger = latest + sign * atr * 0.05
-    risk = max(atr * 1.5, latest * 0.002)
+        rr = 1.5
+    elif regime in {"trend_up", "trend_down", "breakout_transition"}:
+        strategy_family = "trend_follow_long" if direction == Direction.LONG else "trend_follow_short"
+        if structure.get("retest"):
+            setup_type = "breakout_retest"
+        elif technical.get("compression"):
+            setup_type = "compression_breakout"
+        else:
+            setup_type = "trend_pullback"
+        plan = EntryPlan.RETEST if setup_type in {"breakout_retest", "trend_pullback"} else EntryPlan.BREAKOUT_CONFIRMATION
+        trigger = latest + sign * atr * 0.10
+        rr = 2.0
+    else:
+        strategy_family = "countertrend_long" if direction == Direction.LONG else "countertrend_short"
+        setup_type = "range_edge_rejection"
+        plan = EntryPlan.CONDITIONAL_TRIGGER
+        trigger = latest + sign * atr * 0.05
+        rr = 1.5
+    risk = max(atr * (1.0 if strategy_family.startswith("countertrend") else 1.5), latest * 0.002)
     stop = trigger - sign * risk
-    rr = max(1.5, float(snapshot.get("min_rr", 1.5)))
     target = trigger + sign * risk * rr
+    expiry_hours = {"ultra_short": 2, "short": 8, "medium": 24, "long": 72, "intraday": 24}.get(horizon_name, 24)
     return {
         "entry_plan": plan,
         "setup_type": setup_type,
+        "strategy_family": strategy_family,
         "trigger_price": trigger,
         "stop_price": stop,
         "target_price": target,
-        "time_expiry": created_at + timedelta(hours=24),
+        "time_expiry": created_at + timedelta(hours=expiry_hours),
         "risk_reward": rr,
+        "trigger_condition": f"closed_{analysis.get('trigger_timeframe') or '15m'}_candle_confirms_{direction.value}",
+        "entry_zone": {"low": min(trigger, latest), "high": max(trigger, latest)},
+        "context_timeframe": analysis.get("context_timeframe"),
+        "setup_timeframe": analysis.get("setup_timeframe"),
+        "trigger_timeframe": analysis.get("trigger_timeframe"),
+        "structure_score": 1.0 if structure.get("labels") else 0.0,
+        "volatility_score": 1.0 if technical.get("expansion") or technical.get("compression") is not None else 0.0,
+        "level_score": 1.0 if structure.get("range_high") or structure.get("range_low") else 0.0,
+        "orderflow_confirmation": "available" if features.get("orderflow") is not None else "missing",
+        "regime_compatibility": "compatible" if not (strong_trend and strategy_family.startswith("countertrend")) else "blocked",
+        "failure_conditions": ["stop_price", "structure_break", "time_expiry"],
     }
+
+
+def _horizon_value(value: str) -> Horizon:
+    try:
+        return Horizon(value)
+    except ValueError:
+        return Horizon.INTRADAY
 
 
 def _invalidation_reason(reasons: list[str], entry: dict[str, Any]) -> str:

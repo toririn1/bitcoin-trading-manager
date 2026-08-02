@@ -32,6 +32,7 @@ class MarketDataManager:
                 latency_ms=latency_ms,
                 notes=[result.reason] if result.reason else None,
                 quality=result.quality,
+                observation_count=len(result.data),
             )
         else:
             self.health_registry.error(
@@ -45,6 +46,7 @@ class MarketDataManager:
         for provider in self.providers.values():
             started = time.perf_counter()
             try:
+                self.health_registry.attempt(provider.name)
                 result = await provider.discover_products(underlying_ids)
                 self.registry.register_discovered_products(result.products)
                 self._record_result(provider.name, result, (time.perf_counter() - started) * 1000)
@@ -63,6 +65,7 @@ class MarketDataManager:
             return ProviderResult(product.provider, quality=DataQuality.VALIDATION_ERROR, reason="provider_not_registered")
         started = time.perf_counter()
         try:
+            self.health_registry.attempt(provider.name)
             result = await provider.backfill(product, timeframe=timeframe, limit=limit)
             self.storage.append_observations(result.data)
             self._record_result(provider.name, result, (time.perf_counter() - started) * 1000)
@@ -70,6 +73,28 @@ class MarketDataManager:
         except Exception as exc:
             self.health_registry.error(provider.name, type(exc).__name__)
             return ProviderResult(provider.name, quality=DataQuality.PROVIDER_ERROR, reason=str(exc))
+
+    async def backfill_history(
+        self,
+        product_id: str,
+        *,
+        timeframe: str,
+        requested: int,
+        minimum_closed: int = 30,
+    ) -> ProviderResult:
+        existing = self.storage.history_readiness(
+            product_id,
+            timeframe,
+            requested=requested,
+            minimum_closed=minimum_closed,
+        )
+        if existing["analysis_ready"]:
+            return ProviderResult(
+                self.registry.product(product_id).provider if self.registry.product(product_id) else "registry",
+                quality=DataQuality.OK,
+                reason="history_cached",
+            )
+        return await self.backfill(product_id, timeframe=timeframe, limit=requested)
 
     def health(self) -> list[dict[str, Any]]:
         return self.health_registry.all()

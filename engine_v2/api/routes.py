@@ -47,9 +47,40 @@ def register_v2_routes(app: FastAPI, root_dir: str | Path | None = None) -> APIR
         return envelope(engine.registry.to_dict())
 
     @router.get("/products")
-    async def products(request: Request):
+    async def products(
+        request: Request,
+        limit: int = 100,
+        offset: int = 0,
+        provider: str | None = None,
+        role: str | None = None,
+        product_type: str | None = None,
+        include_options: bool = False,
+    ):
         engine = get_engine(request)
-        return envelope([product.to_dict() for product in engine.registry.products.values()])
+        rows = []
+        for product in engine.registry.products.values():
+            if provider and product.provider != provider:
+                continue
+            if role and product.role != role:
+                continue
+            if product_type and product.product_type.value != product_type:
+                continue
+            if not include_options and product.product_type.value == "option":
+                continue
+            rows.append(product.to_dict())
+        rows.sort(key=lambda item: (str(item.get("product_id")), str(item.get("venue_symbol"))))
+        safe_offset = max(0, int(offset))
+        safe_limit = min(max(1, int(limit)), 500)
+        return envelope(
+            rows[safe_offset:safe_offset + safe_limit],
+            meta={
+                "offset": safe_offset,
+                "limit": safe_limit,
+                "total": len(rows),
+                "has_more": safe_offset + safe_limit < len(rows),
+                "options_included": include_options,
+            },
+        )
 
     @router.get("/provider-health")
     async def provider_health(request: Request):
@@ -110,6 +141,33 @@ def register_v2_routes(app: FastAPI, root_dir: str | Path | None = None) -> APIR
         event = get_engine(request).manual_event(body.model_dump())
         return envelope(event)
 
+    @router.get("/history-readiness")
+    async def history_readiness(request: Request):
+        engine = get_engine(request)
+        limits = dict(engine.settings.history_limits)
+        products = [
+            product for product in engine.registry.products.values()
+            if product.role == "tradable" or product.provider == "yfinance_delayed"
+        ]
+        return envelope(engine.storage.history_summary(products, limits, minimum_closed=engine.settings.minimum_sample_count))
+
+    @router.get("/horizons")
+    async def horizons(request: Request, mode: str | None = None, live: bool | None = None):
+        engine = get_engine(request)
+        selected_mode = engine._resolve_mode(mode, live)
+        snapshot = engine.last_snapshot
+        if snapshot is None or snapshot.get("mode") != selected_mode:
+            snapshot = await engine.build_snapshot(mode=selected_mode)
+        rows = []
+        for product_id, state in (snapshot.get("computed_features", {}).get("product_snapshots", {}) or {}).items():
+            rows.append({
+                "product_id": product_id,
+                "underlying_id": (state.get("product") or {}).get("underlying_id"),
+                "analysis_readiness": state.get("analysis_readiness", False),
+                "horizons": state.get("features", {}).get("horizons", {}),
+            })
+        return envelope(rows, generated_at=snapshot.get("generated_at"))
+
     @router.get("/opportunities")
     async def opportunities(request: Request, mode: str | None = None, live: bool | None = None):
         engine = get_engine(request)
@@ -123,7 +181,12 @@ def register_v2_routes(app: FastAPI, root_dir: str | Path | None = None) -> APIR
             or quality.get("quality") in {"data_unavailable", "snapshot_not_generated"}
             or "snapshot_not_generated" in (quality.get("missing") or [])
         )
-        current = [] if unavailable else list(snapshot.get("ranked_candidates") or [])
+        current = [] if unavailable else [
+            item for item in (snapshot.get("ranked_candidates") or [])
+            if item.get("direction") in {"long", "short"}
+            and item.get("candidate_stage", "diagnostic_candidate") != "diagnostic_candidate"
+            and item.get("analysis_readiness", True)
+        ]
         meta = {
             "mode": snapshot.get("mode"),
             "current_candidate_count": len(current),
@@ -137,6 +200,12 @@ def register_v2_routes(app: FastAPI, root_dir: str | Path | None = None) -> APIR
     async def decision(request: Request, mode: str | None = None, live: bool | None = None):
         engine = get_engine(request)
         return envelope(await engine.decision(mode=mode, live=live))
+
+    @router.get("/shadow-candidates")
+    async def shadow_candidates(request: Request, limit: int = 500):
+        engine = get_engine(request)
+        rows = engine.storage.open_candidates(limit=min(max(1, int(limit)), 2000))
+        return envelope(rows, meta={"open_count": len(rows), "mode": engine.settings.mode})
 
     @router.get("/evaluation/summary")
     async def evaluation_summary(request: Request):

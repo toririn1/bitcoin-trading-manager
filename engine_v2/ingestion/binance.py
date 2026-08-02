@@ -9,11 +9,12 @@ from engine_v2.domain.models import Candle, Observation, ProductSpec, TradeExecu
 
 from .base import MarketDataProvider, ProviderCapabilities, ProviderResult, observation_time
 from .http import AsyncJSONClient, ProviderHTTPError
+from .metadata import canonical_product_id, classify_contract, payload_hash
 
 
 BINANCE_FUTURES = "https://fapi.binance.com"
 BINANCE_SPOT = "https://api.binance.com"
-TIMEFRAME_MAP = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
+TIMEFRAME_MAP = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d", "1w": "1w"}
 
 
 def _dt_ms(value: Any) -> datetime | None:
@@ -88,13 +89,14 @@ class BinancePublicProvider(MarketDataProvider):
             if not _supported_contract(item, futures=self.futures):
                 continue
             product_type = ProductType.PERPETUAL if self.futures else ProductType.SPOT
+            contract_type, expiry = classify_contract(item, product_type=product_type)
             if item.get("status") not in ("TRADING", "1", None):
                 continue
             filters = {str(f.get("filterType")): f for f in item.get("filters", []) if isinstance(f, dict)}
             price_filter = filters.get("PRICE_FILTER", {})
             lot_filter = filters.get("LOT_SIZE", {})
             products.append(ProductSpec(
-                product_id=f"{base}_BINANCE_{'PERP' if product_type == ProductType.PERPETUAL else 'SPOT'}",
+                product_id=canonical_product_id(base, "BINANCE", contract_type),
                 underlying_id=underlying,
                 provider=self.name,
                 venue=self.capabilities.venue,
@@ -111,6 +113,12 @@ class BinancePublicProvider(MarketDataProvider):
                 is_tradable=True,
                 capabilities={"exchange_info": item, "source_event_time": None},
                 discovered_at=datetime.now(timezone.utc),
+                contract_type=contract_type,
+                expiry=expiry,
+                delivery_time=expiry,
+                settlement_asset=item.get("marginAsset") or item.get("quoteAsset"),
+                underlying_reference=base,
+                discovery_payload_hash=payload_hash(item),
             ))
         return ProviderResult(self.name, products=products, request_count=1)
 
