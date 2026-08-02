@@ -4,8 +4,8 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 
 from engine_v2.config import V2Settings
-from engine_v2.domain.enums import DataQuality, Direction
-from engine_v2.domain.models import Observation
+from engine_v2.domain.enums import DataQuality, Direction, EntryPlan, Horizon
+from engine_v2.domain.models import Observation, OpportunityCandidate
 from engine_v2.domain.registry import build_default_registry
 from engine_v2.features.cross_asset import dynamic_relationship
 from engine_v2.ingestion.yfinance_delayed import YFinanceDelayedProvider
@@ -91,6 +91,80 @@ def test_global_candidate_ranking_is_independent_of_product_order(tmp_path, monk
     decision = engine._decision_from_snapshot(snapshot)
     assert decision["final_action"] == "research_only_short"
     assert decision["candidate_rank"][0]["product_id"] == "LATER_PRODUCT"
+
+
+def test_equal_score_candidates_use_order_independent_product_tiebreak(tmp_path, monkeypatch):
+    tie_a = {
+        "product_id": "PRODUCT_A",
+        "direction": "long",
+        "setup_type": "retest",
+        "valid_for_shadow": True,
+        "valid_for_user_execution": False,
+        "net_edge_bps": 10,
+        "confidence": 0.5,
+        "heuristic_setup_score": 4,
+        "candidate_status": "research_only_long",
+        "execution_permission": "shadow_only",
+        "setup_quality": "research",
+    }
+    tie_b = {**tie_a, "product_id": "PRODUCT_B"}
+    forward = [item["product_id"] for item in rank_candidates([tie_b, tie_a])]
+    reverse = [item["product_id"] for item in rank_candidates([tie_a, tie_b])]
+    assert forward == reverse == ["PRODUCT_A", "PRODUCT_B"]
+
+    created_at = datetime.now(timezone.utc)
+    object_a = OpportunityCandidate(
+        candidate_id="candidate-z",
+        created_at=created_at,
+        product_id="PRODUCT_A",
+        direction=Direction.LONG,
+        horizon=Horizon.INTRADAY,
+        entry_plan=EntryPlan.RETEST,
+        invalidation=None,
+        setup_type="retest",
+        heuristic_setup_score=4,
+        net_edge_bps=10,
+        confidence=0.5,
+        valid_for_shadow=True,
+        valid_for_user_execution=False,
+    )
+    object_b = OpportunityCandidate(
+        candidate_id="candidate-a",
+        created_at=created_at,
+        product_id="PRODUCT_B",
+        direction=Direction.LONG,
+        horizon=Horizon.INTRADAY,
+        entry_plan=EntryPlan.RETEST,
+        invalidation=None,
+        setup_type="retest",
+        heuristic_setup_score=4,
+        net_edge_bps=10,
+        confidence=0.5,
+        valid_for_shadow=True,
+        valid_for_user_execution=False,
+    )
+    assert [item.product_id for item in rank_candidates([object_b, object_a])] == [
+        "PRODUCT_A",
+        "PRODUCT_B",
+    ]
+
+    monkeypatch.setenv("V2_STORAGE_BACKEND", "sqlite")
+    settings = V2Settings(mode="fixture", live_enabled=False, duckdb_path="data/x.duckdb", parquet_root="data/raw")
+    engine = V2Engine(tmp_path, settings)
+    base_snapshot = {
+        "mode": "fixture",
+        "data_unavailable": False,
+        "ranked_candidates": [tie_b, tie_a],
+        "account_overlay": {},
+        "data_quality": {"score": 100},
+        "computed_features": {"regime": {}},
+        "portfolio_constraints": {},
+    }
+    reversed_snapshot = {**base_snapshot, "ranked_candidates": [tie_a, tie_b]}
+    forward_decision = engine._decision_from_snapshot(base_snapshot)
+    reverse_decision = engine._decision_from_snapshot(reversed_snapshot)
+    assert forward_decision["final_action"] == reverse_decision["final_action"] == "research_only_long"
+    assert forward_decision["selected_product_id"] == reverse_decision["selected_product_id"] == "PRODUCT_A"
 
 
 def test_fixture_weak_directional_candidates_cannot_enter_shadow(tmp_path, monkeypatch):

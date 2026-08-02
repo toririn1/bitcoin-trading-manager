@@ -503,6 +503,7 @@ class V2Engine:
             "market_view": snapshot.get("computed_features", {}).get("regime", {}),
             "setup_verdict": setup_verdict,
             "setup_quality": selected.get("setup_quality") if selected else "unknown",
+            "selected_product_id": selected.get("product_id") if selected else None,
             "candidate_rank": candidates,
             "account_overlay": snapshot.get("account_overlay", {}),
             "portfolio_overlay": snapshot.get("portfolio_constraints", {}),

@@ -12,6 +12,7 @@ codex/v2-decision-loop, normal ancestry from the existing V2 implementation comm
 - Directional candidates retain research value even when action is blocked by missing calibration, costs, guards, account state, or synthetic mode. A minimum heuristic score and data-quality gate are required before a directional candidate can enter shadow; otherwise no_trade is selected.
 - Candidate entry plans are deterministic and replayable.
 - Candidate ranking is global across products, and decision selection shares that ranking instead of depending on registry order.
+- Equal ranking scores use ascending product_id, direction, and setup_type; random candidate IDs are not used.
 - Shadow outcomes are stored only for eligible, deduplicated open candidates. A not-triggered candidate stays open until expiry; the calibration endpoint reports insufficient_sample until enough terminal outcomes exist.
 - Cross-asset relationships are session-aware and timestamp-tolerant.
 - Parquet is batch/atomic; database hashes prevent duplicate restart writes.
@@ -25,4 +26,4 @@ codex/v2-decision-loop, normal ancestry from the existing V2 implementation comm
 - Shadow expiry, deduplication, outcome, and insufficient-sample smoke
 - Provider capability and cross-asset alignment smoke
 
-Final regression: .venv/bin/python -m pytest -q -> 134 passed, 5 warnings, 5 subtests passed, including global product-order ranking regression. Live shadow one-shot: data_unavailable=false, final_action=no_trade, execution_permission=no_trade, settled_outcomes=0, open_shadow_candidates=0.
+Final regression: .venv/bin/python -m pytest -q -> 135 passed, 5 warnings, 5 subtests passed, including global product-order and equal-score tie-break regressions. Live shadow one-shot: data_unavailable=false, final_action=no_trade, execution_permission=no_trade, settled_outcomes=0, open_shadow_candidates=0.

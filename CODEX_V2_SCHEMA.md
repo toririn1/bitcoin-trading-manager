@@ -42,6 +42,7 @@ Decision final_action is:
 actionable_long, actionable_short, research_only_long, research_only_short, no_trade, or data_unavailable.
 
 The decision also contains execution_permission, which is derived from the selected candidate and account/data state.
+It exposes selected_product_id for the selected candidate; equal score keys resolve by product_id, direction, and setup_type ascending, never candidate_id.
 
 ## Outcome and calibration
 
