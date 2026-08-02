@@ -197,6 +197,8 @@ class V2Engine:
         decision_time: datetime,
         account: dict[str, Any],
     ) -> dict[str, Any]:
+        previous_snapshot = self.last_snapshot
+        data_unavailable = not bool(records) and mode in {"live", "replay"}
         by_product: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for record in records:
             by_product[str(record.get("product_id") or "")].append(record)
@@ -205,7 +207,13 @@ class V2Engine:
             for product in self.registry.products.values()
             if (product.role == "tradable" and product.is_tradable) or product.product_id in by_product
         ]
-        candidate_rows = [product.to_dict() for product in self.registry.tradable_products()]
+        # A live/replay snapshot with no observations has zero current
+        # opportunities. The registry is still reported for diagnostics, but
+        # it must never be mistaken for a usable market snapshot.
+        candidate_rows = (
+            [product.to_dict() for product in self.registry.tradable_products()]
+            if not data_unavailable else []
+        )
         product_by_id = {row["product_id"]: row for row in product_rows}
         product_snapshots: dict[str, dict[str, Any]] = {}
         series_by_product: dict[str, list[dict[str, Any]]] = {}
@@ -330,10 +338,22 @@ class V2Engine:
         )
         for candidate in snapshot["ranked_candidates"]:
             candidate["source_snapshot_id"] = snapshot["snapshot_id"]
+        stale_candidates = []
+        stale_snapshot_id = None
+        stale_generated_at = None
+        if data_unavailable and previous_snapshot:
+            stale_candidates = list(previous_snapshot.get("ranked_candidates") or [])
+            stale_snapshot_id = previous_snapshot.get("snapshot_id")
+            stale_generated_at = previous_snapshot.get("generated_at")
         snapshot["account_overlay"] = account
         snapshot["mode"] = mode
         snapshot["synthetic"] = mode == "fixture"
-        snapshot["data_unavailable"] = not bool(records) and mode in {"live", "replay"}
+        snapshot["data_unavailable"] = data_unavailable
+        snapshot["current_candidate_count"] = len(snapshot["ranked_candidates"])
+        snapshot["stale_candidates"] = stale_candidates
+        snapshot["stale_candidate_count"] = len(stale_candidates)
+        snapshot["stale_candidate_snapshot_id"] = stale_snapshot_id
+        snapshot["stale_candidate_generated_at"] = stale_generated_at
         snapshot["explanation"] = explain_snapshot(snapshot)
         snapshot["critic"] = validate_claims(snapshot["explanation"], snapshot)
         self.last_snapshot = snapshot
@@ -509,6 +529,11 @@ class V2Engine:
             "setup_quality": selected.get("setup_quality") if selected else "unknown",
             "selected_product_id": selected.get("product_id") if selected else None,
             "candidate_rank": candidates,
+            "current_candidate_count": len(candidates),
+            "stale_candidates": snapshot.get("stale_candidates", []),
+            "stale_candidate_count": snapshot.get("stale_candidate_count", 0),
+            "stale_candidate_snapshot_id": snapshot.get("stale_candidate_snapshot_id"),
+            "stale_candidate_generated_at": snapshot.get("stale_candidate_generated_at"),
             "account_overlay": snapshot.get("account_overlay", {}),
             "portfolio_overlay": snapshot.get("portfolio_constraints", {}),
             "product_guard": {},

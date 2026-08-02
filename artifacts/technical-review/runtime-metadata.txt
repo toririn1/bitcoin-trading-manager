@@ -1,0 +1,4 @@
+pid=100145
+collected_at=2026-08-03T02:20:00+09:00
+branch=codex/technical-review-v2-ui
+head=fc0ae226401f91bcc1f195d504bc21a0beecb5ed

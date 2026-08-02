@@ -84,6 +84,51 @@ def test_force_orders_is_not_in_v2_provider_source():
     assert "forceOrders" not in source
 
 
+def test_binance_discovery_rejects_tradifi_rows_and_preserves_product_metadata():
+    from engine_v2.domain.enums import ProductType
+    from engine_v2.ingestion.binance import BinancePublicProvider
+    from engine_v2.ingestion.http import JSONResponse
+
+    class FakeClient:
+        async def get(self, url, params=None, headers=None):
+            return JSONResponse({
+                "symbols": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "baseAsset": "BTC",
+                        "quoteAsset": "USDT",
+                        "contractType": "PERPETUAL",
+                        "status": "TRADING",
+                    },
+                    {
+                        "symbol": "SOXLUSDT",
+                        "baseAsset": "SOXL",
+                        "quoteAsset": "USDT",
+                        "contractType": "TRADIFI_PERPETUAL",
+                        "underlyingType": "EQUITY",
+                        "underlyingSubType": ["TradFi"],
+                        "status": "TRADING",
+                    },
+                ]
+            }, 200, {}, 0)
+
+    result = asyncio.run(
+        BinancePublicProvider(client=FakeClient(), futures=True).discover_products(
+            ["BTC", "SOXL"]
+        )
+    )
+    assert len(result.products) == 1
+    product = result.products[0]
+    assert product.product_id == "BTC_BINANCE_PERP"
+    assert product.product_type == ProductType.PERPETUAL
+    assert {
+        product.role,
+        product.provider,
+        product.venue,
+        product.is_tradable,
+    } == {"tradable", "binance", "binance_futures", True}
+
+
 def test_fixture_engine_produces_no_trade_candidate_without_llm():
     async def run():
         engine = V2Engine()

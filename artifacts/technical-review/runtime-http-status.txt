@@ -1,0 +1,12 @@
+status 200
+products 200
+provider-health 200
+data-health 200
+snapshot-live 200
+opportunities-live 200
+decision-live 200
+cross-asset 200
+factors 200
+analysis-status 200
+products-after-snapshot 200
+ui-index 200

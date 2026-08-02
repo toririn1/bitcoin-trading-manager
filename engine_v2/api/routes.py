@@ -113,8 +113,25 @@ def register_v2_routes(app: FastAPI, root_dir: str | Path | None = None) -> APIR
     @router.get("/opportunities")
     async def opportunities(request: Request, mode: str | None = None, live: bool | None = None):
         engine = get_engine(request)
-        snapshot = engine.last_snapshot or await engine.build_snapshot(mode=mode, live=live)
-        return envelope(snapshot.get("ranked_candidates", []), generated_at=snapshot.get("generated_at"))
+        selected_mode = engine._resolve_mode(mode, live)
+        snapshot = engine.last_snapshot
+        if snapshot is None or snapshot.get("mode") != selected_mode:
+            snapshot = await engine.build_snapshot(mode=selected_mode)
+        quality = snapshot.get("data_quality") or {}
+        unavailable = (
+            bool(snapshot.get("data_unavailable"))
+            or quality.get("quality") in {"data_unavailable", "snapshot_not_generated"}
+            or "snapshot_not_generated" in (quality.get("missing") or [])
+        )
+        current = [] if unavailable else list(snapshot.get("ranked_candidates") or [])
+        meta = {
+            "mode": snapshot.get("mode"),
+            "current_candidate_count": len(current),
+            "stale_candidate_count": snapshot.get("stale_candidate_count", 0),
+            "stale_candidate_snapshot_id": snapshot.get("stale_candidate_snapshot_id"),
+            "stale_candidate_generated_at": snapshot.get("stale_candidate_generated_at"),
+        }
+        return envelope(current, generated_at=snapshot.get("generated_at"), meta=meta)
 
     @router.get("/decision")
     async def decision(request: Request, mode: str | None = None, live: bool | None = None):

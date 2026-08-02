@@ -23,6 +23,30 @@ def _dt_ms(value: Any) -> datetime | None:
         return None
 
 
+def _supported_contract(item: dict[str, Any], *, futures: bool) -> bool:
+    """Accept only contracts this provider can model as real crypto products.
+
+    Binance's futures catalog also contains TradFi perpetual rows such as
+    NVDAUSDT and SOXLUSDT. They are not Binance spot/perpetual crypto
+    products supported by this engine, so they must never be registered as
+    tradable ProductSpecs.
+    """
+    contract_type = str(item.get("contractType") or "").upper()
+    underlying_type = str(item.get("underlyingType") or "").upper()
+    underlying_subtypes = {
+        str(value).upper()
+        for value in (item.get("underlyingSubType") or [])
+        if value is not None
+    }
+    if "TRADIFI" in contract_type or "TRADIFI" in underlying_type or "TRADIFI" in underlying_subtypes:
+        return False
+    if underlying_type in {"EQUITY", "ETF", "STOCK", "INDEX", "FX", "COMMODITY"}:
+        return False
+    if futures:
+        return contract_type == "PERPETUAL"
+    return contract_type in {"", "SPOT"}
+
+
 class BinancePublicProvider(MarketDataProvider):
     name = "binance"
 
@@ -61,7 +85,9 @@ class BinancePublicProvider(MarketDataProvider):
             underlying = "BTC" if base == "BTC" else base
             if underlying_ids and underlying not in underlying_ids:
                 continue
-            product_type = ProductType.PERPETUAL if self.futures and item.get("contractType") == "PERPETUAL" else ProductType.SPOT
+            if not _supported_contract(item, futures=self.futures):
+                continue
+            product_type = ProductType.PERPETUAL if self.futures else ProductType.SPOT
             if item.get("status") not in ("TRADING", "1", None):
                 continue
             filters = {str(f.get("filterType")): f for f in item.get("filters", []) if isinstance(f, dict)}

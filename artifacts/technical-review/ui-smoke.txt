@@ -1,0 +1,2 @@
+ui-js-syntax ok
+ui-http 200

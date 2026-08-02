@@ -74,6 +74,50 @@ def test_production_snapshot_does_not_fallback_to_fixture(monkeypatch):
         assert data["data_unavailable"] is True
 
 
+def test_unavailable_snapshot_has_zero_current_candidates_and_separate_stale_cache(monkeypatch):
+    async def no_live_observations():
+        return []
+
+    with TestClient(app) as client:
+        monkeypatch.setattr(app.state.v2_engine, "_live_observations", no_live_observations)
+        warm = client.get("/api/v2/demo/snapshot")
+        assert warm.status_code == 200
+        live_snapshot = client.get("/api/v2/snapshot?mode=live")
+        assert live_snapshot.status_code == 200
+        snapshot = live_snapshot.json()["data"]
+        assert snapshot["data_unavailable"] is True
+        assert snapshot["ranked_candidates"] == []
+        assert snapshot["current_candidate_count"] == 0
+        assert snapshot["stale_candidate_count"] > 0
+        assert snapshot["stale_candidate_generated_at"]
+
+        decision = client.get("/api/v2/decision?mode=live")
+        assert decision.status_code == 200
+        decision_data = decision.json()["data"]
+        assert decision_data["final_action"] == "data_unavailable"
+        assert decision_data["candidate_rank"] == []
+        assert decision_data["current_candidate_count"] == 0
+        assert decision_data["stale_candidate_count"] > 0
+
+        opportunities = client.get("/api/v2/opportunities?mode=live")
+        assert opportunities.status_code == 200
+        opportunities_body = opportunities.json()
+        assert opportunities_body["data"] == []
+        assert opportunities_body["meta"]["current_candidate_count"] == 0
+        assert opportunities_body["meta"]["stale_candidate_count"] > 0
+
+
+def test_v2_ui_separates_legacy_llm_and_canonical_current_candidates():
+    html = Path(__file__).resolve().parents[1].joinpath("static", "index.html").read_text()
+    assert "LEGACY LLM / ANALYSIS CACHE" in html
+    assert "V2 ENGINE / DETERMINISTIC / READ-ONLY SHADOW" in html
+    assert 'String(item.product_id || "unknown")' in html
+    assert "const currentCandidates = unavailable ? [] : candidates;" in html
+    assert "countEl.textContent = String(currentCandidates.length);" in html
+    assert 'const decisionRes = await fetch("/api/v2/decision");' in html
+    assert "Promise.all([" not in html[html.index("async function fetchV2Dashboard()"):html.index("fetchV2Dashboard();")]
+
+
 def test_manual_intake_requires_token_when_configured(monkeypatch):
     monkeypatch.setenv("SAVE_TICKER_INTAKE_TOKEN", "test-intake-token")
     with TestClient(app) as client:
