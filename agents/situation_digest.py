@@ -229,7 +229,7 @@ def summarize_situation_tags(
         ob = _oi_bin(market_ctx.get("oi_change_24h_pct"))
         if ob:
             tags.append(f"oi_24h:{ob}")
-        sb = _skew_bin(market_ctx.get("skew_25d"))
+        sb = _skew_bin(market_ctx.get("estimated_skew_proxy"))
         if sb:
             tags.append(f"skew:{sb}")
 

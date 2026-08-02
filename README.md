@@ -211,3 +211,35 @@ bitcoin-trading-manager/
 ## License
 
 MIT
+
+## V2 market engine
+
+The engine_v2 package is the new multi-asset, point-in-time decision-support path. It preserves the existing FastAPI/UI and read-only account integration while separating:
+
+- source event time, publish time, collection time, and backtest availability time;
+- closed candles from forming candles;
+- actual liquidations, partial public liquidation pulses, and estimated clusters;
+- trade-stream CVD from hourly taker buckets;
+- actual Greek-delta option risk reversals from estimated proxies;
+- deterministic scores, costs, quality gates, portfolio guards, and execution permission from LLM explanations.
+
+V2 endpoints are additive under /api/v2/:
+
+- /api/v2/status
+- /api/v2/universe
+- /api/v2/products
+- /api/v2/provider-health
+- /api/v2/data-health
+- /api/v2/snapshot
+- /api/v2/cross-asset
+- /api/v2/factors
+- /api/v2/events
+- /api/v2/events/manual-intake
+- /api/v2/opportunities
+- /api/v2/decision
+- /api/v2/evaluation/summary
+- /api/v2/evaluation/calibration
+
+Fixture smoke mode works without provider credentials. Set V2_LIVE_ENABLED=true only when public/live provider access is intended. Product symbols for SOXL and SK Hynix are registered only from discovery; they are not guessed. V2 never creates, changes, cancels, or executes an order.
+
+See CODEX_V2_SOURCE_AUDIT.md, CODEX_V2_SCHEMA.md, CODEX_V2_STATE.md, and CODEX_V2_REPORT.md.

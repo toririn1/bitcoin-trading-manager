@@ -9,7 +9,7 @@ SOURCE_LABELS = {
     "price_source": "Binance Spot BTCUSDT", "spot_volume_source": "Binance Spot",
     "futures_oi_source": "Bybit BTCUSDT Perpetual + Binance Futures optional",
     "funding_source": "Bybit Perpetual",
-    "cvd_source": "Binance/Bybit taker buy-sell volume bucket, not footprint CVD",
+    "taker_bucket_delta_source": "Binance/Bybit taker buy-sell volume bucket, not footprint CVD",
     "account_source": "Gate.io read-only", "fee_source": "Gate.io futures transaction history",
     "rebate_source": "Gate.io affiliate commission rebate history",
 }

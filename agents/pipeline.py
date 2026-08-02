@@ -69,11 +69,11 @@ RISK_TRIAD_IN_PIPELINE = (
     os.getenv("RISK_ENABLED", "1") not in ("0", "false", "False", "")
 )
 MEMORY_IN_PIPELINE = (
-    os.getenv("MEMORY_ENABLED", "1") not in ("0", "false", "False", "")
+    os.getenv("MEMORY_ENABLED", "0") not in ("0", "false", "False", "")
 )
 # 에이전트 메모리 쓰기 여부 (분석 환경에서 기록 방지용)
 AGENT_MEMORY_WRITE_ENABLED = (
-    os.getenv("AGENT_MEMORY_WRITE_ENABLED", "1") not in ("0", "false", "False", "")
+    os.getenv("AGENT_MEMORY_WRITE_ENABLED", "0") not in ("0", "false", "False", "")
 )
 
 

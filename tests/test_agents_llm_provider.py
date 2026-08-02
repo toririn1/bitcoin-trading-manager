@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import config
 import llm_client
+import agents.debate as debate_module
 from agents.debate import run_bull_bear_debate
 from agents.judge import run_judge
 from agents.risk_triad import run_risk_triad
@@ -21,6 +22,7 @@ class AgentLLMProviderTests(unittest.TestCase):
 
     def test_openai_oauth_debate_judge_risk_precheck_passes_without_key(self):
         with (
+            patch.object(debate_module, "DEBATE_ENABLED", True),
             patch.object(config, "LLM_PROVIDER", "openai_oauth"),
             patch.object(config, "LLM_BASE_URL", "http://127.0.0.1:10532/v1"),
             patch.object(config, "LLM_MODEL", "gpt-5.6-sol"),
@@ -56,6 +58,7 @@ class AgentLLMProviderTests(unittest.TestCase):
                 return {"choices": [{"message": {"content": "ok"}}]}
 
         with (
+            patch.object(debate_module, "DEBATE_ENABLED", True),
             patch.object(config, "LLM_PROVIDER", "openai_oauth"),
             patch.object(config, "LLM_BASE_URL", "http://127.0.0.1:10532/v1"),
             patch.object(config, "LLM_MODEL", "gpt-5.6-sol"),

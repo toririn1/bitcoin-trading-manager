@@ -43,7 +43,7 @@ DEBATE_MAX_ROUNDS = int(os.getenv("DEBATE_MAX_ROUNDS", "1"))
 DEBATE_MAX_OUTPUT_TOKENS = int(os.getenv("DEBATE_MAX_OUTPUT_TOKENS", "4500"))
 
 # 토론 자체를 끄고 싶을 때: DEBATE_ENABLED=0
-DEBATE_ENABLED = os.getenv("DEBATE_ENABLED", "1") not in ("0", "false", "False", "")
+DEBATE_ENABLED = os.getenv("DEBATE_ENABLED", "0") not in ("0", "false", "False", "")
 
 
 @dataclass

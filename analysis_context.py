@@ -14,7 +14,7 @@ _REQUIRED_TF_COLUMNS = (
 )
 
 _MACRO_KEYS = ("TNX_10Y", "FVX_5Y", "DXY", "STABLE_MCAP", "USDT_DOM", "BTC_DOM", "HYG_LQD", "IBIT_PX")
-_MARKET_KEYS = ("funding_rate", "open_interest", "combined_oi", "cvd_4h", "ob_imbalance")
+_MARKET_KEYS = ("funding_rate", "open_interest", "combined_oi", "taker_bucket_delta_4h", "ob_imbalance")
 _ACCOUNT_KEYS = ("wallet_balance", "account_equity", "open_position_count", "today_cash_pnl")
 _GATE_ACCOUNT_KEYS = ("total_assets", "account_equity", "open_position_count", "today_total_pnl")
 

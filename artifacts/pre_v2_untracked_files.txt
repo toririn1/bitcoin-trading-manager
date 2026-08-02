@@ -1,0 +1,8 @@
+after_codex_pytest.txt
+analyzer_snapshot.txt
+artifacts/pre_v2_worktree.patch
+before_codex_diffstat.txt
+before_codex_pytest.txt
+before_codex_status.txt
+d -n 1,260p CODEX_REPORT.md
+t.txt

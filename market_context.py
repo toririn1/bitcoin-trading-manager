@@ -36,38 +36,16 @@ def _signed_get(url: str, params: dict) -> requests.Response:
 # ══════════════════════════════════════════════
 
 def _fetch_liquidation_events(symbol: str, ctx: dict) -> None:
+    """Disable the legacy private liquidation endpoint.
+
+    A user-scoped force-close feed is not a market-wide liquidation aggregate.
+    V2 requires actual public events or an explicitly partial pulse snapshot.
     """
-    Binance forceOrders API로 최근 4시간 강제청산 합계 수집.
-    side=SELL → 롱청산 / side=BUY → 숏청산(스퀴즈). 총계만 집계 (개별 건 불필요).
-    """
-    try:
-        start_ms = int((_time.time() - 4 * 3600) * 1000)
-        r = _signed_get(
-            f"{BINANCE_FUTURES_URL}/fapi/v1/forceOrders",
-            {"symbol": symbol, "autoCloseType": "LIQUIDATION",
-             "startTime": start_ms, "limit": 100},
-        )
-        r.raise_for_status()
-        orders = r.json()
-
-        long_usd = short_usd = 0.0
-        for o in orders:
-            qty   = float(o.get("executedQty") or o.get("origQty") or 0)
-            price = float(o.get("avgPrice") or o.get("price") or 0)
-            usd   = qty * price
-            if o["side"] == "SELL":
-                long_usd += usd
-            else:
-                short_usd += usd
-
-        ctx["liquidation_events"] = bool(orders)   # 이벤트 유무 (출력용 flag)
-        ctx["liq_long_usd"]       = long_usd
-        ctx["liq_short_usd"]      = short_usd
-
-    except Exception:
-        ctx["liquidation_events"] = None
-        ctx["liq_long_usd"]       = None
-        ctx["liq_short_usd"]      = None
+    ctx["liquidation_events"] = None
+    ctx["liq_long_usd"] = None
+    ctx["liq_short_usd"] = None
+    ctx["liquidation_quality"] = "invalid_semantics"
+    ctx["liquidation_reason"] = "private_user_force_close_feed_not_market_total"
 
 
 def _fetch_binance(symbol: str, ctx: dict) -> None:
@@ -152,23 +130,23 @@ def _fetch_binance(symbol: str, ctx: dict) -> None:
             # ── CVD (Cumulative Volume Delta) ────────
             # CVD = 누적(매수 테이커량 - 매도 테이커량)
             # 양수 편향: 매수 우세 / 음수 편향: 매도 우세
-            cvd_series = []
+            taker_bucket_cumulative_24h_series = []
             cumulative = 0.0
             for h in taker_hist:
                 delta = h["buy"] - h["sell"]
                 cumulative += delta
-                cvd_series.append(round(cumulative, 2))
+                taker_bucket_cumulative_24h_series.append(round(cumulative, 2))
 
-            ctx["cvd_series"]  = cvd_series          # 24h 시계열 (오래된→최근)
-            ctx["cvd_current"] = cvd_series[-1]       # 최종 누적값
-            ctx["cvd_4h"]      = sum(                 # 최근 4h 델타 (단기 모멘텀)
+            ctx["taker_bucket_cumulative_24h_series"]  = taker_bucket_cumulative_24h_series          # 24h 시계열 (오래된→최근)
+            ctx["taker_bucket_cumulative_24h"] = taker_bucket_cumulative_24h_series[-1]       # 최종 누적값
+            ctx["taker_bucket_delta_4h"]      = sum(                 # 테이커 버킷 최근 4h 델타 (단기 모멘텀)
                 h["buy"] - h["sell"] for h in taker_hist[-4:]
             )
             ctx.update(taker_delta_features(taker_hist))
         else:
-            ctx["taker_history"] = ctx["cvd_series"] = ctx["cvd_current"] = ctx["cvd_4h"] = None
+            ctx["taker_history"] = ctx["taker_bucket_cumulative_24h_series"] = ctx["taker_bucket_cumulative_24h"] = ctx["taker_bucket_delta_4h"] = None
     except Exception:
-        ctx["taker_history"] = ctx["cvd_series"] = ctx["cvd_current"] = ctx["cvd_4h"] = None
+        ctx["taker_history"] = ctx["taker_bucket_cumulative_24h_series"] = ctx["taker_bucket_cumulative_24h"] = ctx["taker_bucket_delta_4h"] = None
 
 
 # ══════════════════════════════════════════════
@@ -206,8 +184,15 @@ def _fetch_top_trader_ratios(symbol: str, ctx: dict) -> None:
 # Deribit 옵션 시장
 # ══════════════════════════════════════════════
 
-def _fetch_deribit(btc_price: float, ctx: dict) -> None:
+def _fetch_deribit(btc_price: float | None, ctx: dict) -> None:
     """DVOL 지수 + 25-delta 스큐 근사 (7~45일 만기 기준)"""
+    if btc_price is None:
+        ctx["estimated_skew_proxy"] = None
+        ctx["estimated_skew_expiry"] = None
+        ctx["estimated_skew_call_iv"] = None
+        ctx["estimated_skew_put_iv"] = None
+        ctx["estimated_skew_days_left"] = None
+        return
 
     # ── DVOL ────────────────────────────────────
     try:
@@ -259,7 +244,7 @@ def _fetch_deribit(btc_price: float, ctx: dict) -> None:
             })
 
         if not parsed:
-            ctx["skew_25d"] = ctx["skew_expiry"] = ctx["skew_call_iv"] = ctx["skew_put_iv"] = None
+            ctx["estimated_skew_proxy"] = ctx["estimated_skew_expiry"] = ctx["estimated_skew_call_iv"] = ctx["estimated_skew_put_iv"] = None
             return
 
         # 가장 가까운 만기 선택
@@ -287,16 +272,16 @@ def _fetch_deribit(btc_price: float, ctx: dict) -> None:
         )
 
         if calls and puts:
-            ctx["skew_25d"]      = round(puts[0]["iv"] - calls[0]["iv"], 1)
-            ctx["skew_expiry"]   = front[0]["expiry"].strftime("%d%b%y")
-            ctx["skew_call_iv"]  = round(calls[0]["iv"], 1)
-            ctx["skew_put_iv"]   = round(puts[0]["iv"], 1)
-            ctx["skew_days_left"] = front_days   # 만기까지 잔여 일수 (오차 판단용)
+            ctx["estimated_skew_proxy"]      = round(puts[0]["iv"] - calls[0]["iv"], 1)
+            ctx["estimated_skew_expiry"]   = front[0]["expiry"].strftime("%d%b%y")
+            ctx["estimated_skew_call_iv"]  = round(calls[0]["iv"], 1)
+            ctx["estimated_skew_put_iv"]   = round(puts[0]["iv"], 1)
+            ctx["estimated_skew_days_left"] = front_days   # 만기까지 잔여 일수 (오차 판단용)
         else:
-            ctx["skew_25d"] = ctx["skew_expiry"] = ctx["skew_call_iv"] = ctx["skew_put_iv"] = ctx["skew_days_left"] = None
+            ctx["estimated_skew_proxy"] = ctx["estimated_skew_expiry"] = ctx["estimated_skew_call_iv"] = ctx["estimated_skew_put_iv"] = ctx["estimated_skew_days_left"] = None
 
     except Exception:
-        ctx["skew_25d"] = ctx["skew_expiry"] = ctx["skew_call_iv"] = ctx["skew_put_iv"] = None
+        ctx["estimated_skew_proxy"] = ctx["estimated_skew_expiry"] = ctx["estimated_skew_call_iv"] = ctx["estimated_skew_put_iv"] = None
 
 
 # ══════════════════════════════════════════════
@@ -443,7 +428,10 @@ def fetch_market_context(symbol: str = DEFAULT_SYMBOL) -> dict:
     _fetch_bybit_oi(ctx, symbol)
     _fetch_fear_greed(ctx)
 
-    btc_price = ctx.get("mark_price") or ctx.get("index_price") or 80000.0
+    btc_price = ctx.get("mark_price") or ctx.get("index_price")
+    if btc_price is None:
+        ctx["deribit_quality"] = "error"
+        ctx["deribit_reason"] = "missing_underlying_price"
     _fetch_deribit(btc_price, ctx)
 
     ctx.update(SOURCE_LABELS)
@@ -497,21 +485,21 @@ def format_market_context(ctx: dict) -> str:
             f"(최근: 매수 {last['buy']:,.1f} BTC / 매도 {last['sell']:,.1f} BTC)"
         )
 
-    # ── CVD (Cumulative Volume Delta, 24h 기준) ──
-    if ctx.get("cvd_current") is not None:
-        cvd_24h  = ctx["cvd_current"]
-        cvd_4h   = ctx.get("cvd_4h", 0) or 0
+    # ── 테이커 버킷 누적 델타 (24h 기준) ──
+    if ctx.get("taker_bucket_cumulative_24h") is not None:
+        cvd_24h  = ctx["taker_bucket_cumulative_24h"]
+        taker_bucket_delta_4h   = ctx.get("taker_bucket_delta_4h", 0) or 0
         cvd_dir  = "매수 우세" if cvd_24h > 0 else "매도 우세"
-        cvd4_dir = "매수 강화" if cvd_4h > 0 else "매도 강화"
+        cvd4_dir = "매수 강화" if taker_bucket_delta_4h > 0 else "매도 강화"
         # 시계열 6개 샘플(오래된→최근) — 방향 전환 시점 파악용
-        series = ctx.get("cvd_series") or []
+        series = ctx.get("taker_bucket_cumulative_24h_series") or []
         # 6h 간격으로 샘플링 (24개 중 4개 + 최신)
         sample_idx = [0, 6, 12, 18, -1]
         samples = [series[i] for i in sample_idx if abs(i) < len(series)]
         sample_str = " → ".join(f"{v:+,.0f}" for v in samples)
         lines.append(
-            f"  CVD 24h 누적 델타: {cvd_24h:+,.1f} BTC ({cvd_dir}) / "
-            f"최근 4h 델타: {cvd_4h:+,.1f} BTC ({cvd4_dir})"
+            f"  테이커 버킷 누적 델타 24h: {cvd_24h:+,.1f} BTC ({cvd_dir}) / "
+            f"테이커 버킷 최근 4h 델타: {taker_bucket_delta_4h:+,.1f} BTC ({cvd4_dir})"
         )
         lines.append(
             f"  CVD 추이(24h 샘플): {sample_str}  "
@@ -596,15 +584,15 @@ def format_market_context(ctx: dict) -> str:
             f"  ※ 실현변동성(RV)은 각 TF 지표 섹션 참조 — RV>DVOL: IV 할인(변동성 확대 예상) / RV<DVOL: IV 프리미엄(불확실성 과대반영)"
         )
 
-    if ctx.get("skew_25d") is not None:
-        skew      = ctx["skew_25d"]
-        days_left = ctx.get("skew_days_left")
+    if ctx.get("estimated_skew_proxy") is not None:
+        skew      = ctx["estimated_skew_proxy"]
+        days_left = ctx.get("estimated_skew_days_left")
         days_str  = f"잔여 {days_left}일" if days_left is not None else ""
         # 14일 미만 만기: BS 역산 오차가 급격히 커져 부호 반전 가능
         short_warn = "  ⚠️ 단기 만기 — BS 오차 특히 큼, 부호조차 신뢰도 낮음" if (days_left is not None and days_left < 14) else ""
         lines.append(
-            f"  25d 스큐 ({ctx['skew_expiry']}, {days_str}): {skew:+.1f} "
-            f"(콜IV {ctx['skew_call_iv']:.1f} / 풋IV {ctx['skew_put_iv']:.1f})"
+            f"  추정 스큐 proxy ({ctx['estimated_skew_expiry']}, {days_str}): {skew:+.1f} "
+            f"(콜IV {ctx['estimated_skew_call_iv']:.1f} / 풋IV {ctx['estimated_skew_put_iv']:.1f})"
             f"  ※ BS 역산 근사값·근월물 단일 만기 스냅샷(기간 구조 미반영) — 부호·크기 수준만 참고{short_warn}"
         )
 

@@ -2837,10 +2837,10 @@ a.status-chip { cursor: pointer; }
       <div class="card-note">양수=롱과열 / 음수=숏과열</div>
     </div>
     <div class="macro-card" id="sent-cvd">
-      <div class="card-label">CVD 4h</div>
+      <div class="card-label">테이커 델타 4h</div>
       <div class="card-value" style="color:var(--text-muted);">—</div>
       <div class="card-sub" style="color:var(--text-muted);">로딩 중</div>
-      <div class="card-note">테이커 누적 델타</div>
+      <div class="card-note">테이커 버킷 누적 델타</div>
     </div>
     <div class="macro-card" id="sent-ob">
       <div class="card-label">오더북 불균형</div>
@@ -2924,6 +2924,27 @@ a.status-chip { cursor: pointer; }
             </button>
             <span id="reflect-status" class="agents-reflect-status"></span>
           </div>
+        </div>
+      </div>
+
+
+      <!-- V2 시장 엔진: 기존 레거시 패널과 독립적인 결정지원 요약 -->
+      <div class="panel-card" id="v2-panel">
+        <div class="panel-card-header">
+          <div class="panel-card-dot" style="background:#0D9488;"></div>
+          <span class="panel-card-label">V2 시장 엔진</span>
+          <span id="v2-health-badge" style="margin-left:auto;font-size:10px;color:var(--text-dim);">fixture 대기</span>
+        </div>
+        <div class="panel-card-body" style="padding:12px 14px;">
+          <div id="v2-decision-summary" style="font-size:13px;font-weight:700;color:var(--text-strong);margin-bottom:8px;">V2 snapshot을 준비하는 중입니다.</div>
+          <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin-bottom:10px;">
+            <div class="macro-card" style="padding:8px;"><div class="card-label">Action</div><div id="v2-action" class="card-value" style="font-size:16px;">—</div></div>
+            <div class="macro-card" style="padding:8px;"><div class="card-label">Quality</div><div id="v2-quality" class="card-value" style="font-size:16px;">—</div></div>
+            <div class="macro-card" style="padding:8px;"><div class="card-label">Candidates</div><div id="v2-candidate-count" class="card-value" style="font-size:16px;">—</div></div>
+          </div>
+          <div class="card-label" style="margin:6px 0;">Opportunity ranking</div>
+          <div id="v2-ranking" style="font-size:11px;color:var(--text-dim);">—</div>
+          <div id="v2-missing" style="font-size:10px;color:var(--text-muted);margin-top:8px;"></div>
         </div>
       </div>
 
@@ -7817,8 +7838,8 @@ async function fetchSentiment() {
       renderFearGreed(d.fear_greed, d.fear_greed_label);
     if (d.funding_rate !== null && d.funding_rate !== undefined)
       renderFundingCard(d.funding_rate);
-    if (d.cvd_4h !== null && d.cvd_4h !== undefined)
-      renderCvdCard(d.cvd_4h);
+    if (d.taker_bucket_delta_4h !== null && d.taker_bucket_delta_4h !== undefined)
+      renderCvdCard(d.taker_bucket_delta_4h);
     if (d.ob_imbalance !== null && d.ob_imbalance !== undefined)
       renderObCard(d.ob_imbalance);
     renderOiCard(d.combined_oi, d.open_interest);
@@ -7830,6 +7851,57 @@ async function fetchSentiment() {
 // 페이지 로드 시 + 5분 간격 갱신
 fetchSentiment();
 setInterval(fetchSentiment, 5 * 60 * 1000);
+
+
+async function fetchV2Dashboard() {
+  try {
+    const [decisionRes, healthRes] = await Promise.all([
+      fetch("/api/v2/decision"),
+      fetch("/api/v2/data-health"),
+    ]);
+    if (!decisionRes.ok || !healthRes.ok) throw new Error("v2 unavailable");
+    const decisionBody = await decisionRes.json();
+    const healthBody = await healthRes.json();
+    const d = decisionBody.data || {};
+    const health = healthBody.data || {};
+    const candidates = Array.isArray(d.candidate_rank) ? d.candidate_rank : [];
+    const quality = Number(health.score);
+    const action = String(d.final_action || "data_unavailable");
+    const actionEl = document.getElementById("v2-action");
+    const qualityEl = document.getElementById("v2-quality");
+    const countEl = document.getElementById("v2-candidate-count");
+    const badge = document.getElementById("v2-health-badge");
+    if (!actionEl) return;
+    actionEl.textContent = action;
+    actionEl.style.color = action === "long" ? C.bull : action === "short" ? C.bear : C.muted;
+    qualityEl.textContent = Number.isFinite(quality) ? quality + "/100" : "N/A";
+    qualityEl.style.color = quality >= 70 ? C.bull : quality >= 50 ? C.amber : C.bear;
+    countEl.textContent = String(candidates.length);
+    badge.textContent = health.quality === "ok" ? "deterministic · fixture" : "data quality 확인 필요";
+    badge.style.color = health.quality === "ok" ? C.teal : C.amber;
+    document.getElementById("v2-decision-summary").textContent =
+      action === "no_trade" ? "현재 비용·품질·guard를 통과한 진입 후보가 없습니다." :
+      "V2 deterministic decision: " + action;
+    document.getElementById("v2-ranking").innerHTML = candidates.slice(0, 5).map((item, index) => {
+      const edge = item.net_edge_bps == null ? "N/A" : Number(item.net_edge_bps).toFixed(1) + " bps";
+      const valid = item.valid ? "허용 후보" : "차단";
+      return "<div style=\"display:flex;gap:6px;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border);\"><span>" +
+        (index + 1) + ". " + escapeHtml(String(item.product_id || "unknown")) + " " + escapeHtml(String(item.direction || "")) +
+        "</span><span>" + edge + " · " + valid + "</span></div>";
+    }).join("") || "후보 없음";
+    const missing = Array.isArray(health.missing) ? health.missing.slice(0, 4) : [];
+    document.getElementById("v2-missing").textContent = missing.length ? "결측/제한: " + missing.join(", ") : "결측 없음";
+  } catch (error) {
+    const badge = document.getElementById("v2-health-badge");
+    if (badge) {
+      badge.textContent = "V2 데이터 대기";
+      badge.style.color = C.muted;
+    }
+  }
+}
+
+fetchV2Dashboard();
+setInterval(fetchV2Dashboard, 5 * 60 * 1000);
 
 // ══════════════════════════════════════════════
 // 에러

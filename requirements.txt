@@ -11,3 +11,6 @@ rank_bm25>=0.2.2
 yfinance>=0.2.40
 
 pytest
+# V2 point-in-time storage (optional at runtime; V2 reports explicit fallback when unavailable)
+duckdb>=1.0.0
+pyarrow>=14.0.0

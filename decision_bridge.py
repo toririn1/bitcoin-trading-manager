@@ -435,7 +435,7 @@ def build_decision_support(market: dict | None = None, account: dict | None = No
         overlay["data_integrity_error"],
     )
     source_labels = {key: market.get(key, value) for key, value in SOURCE_LABELS.items()}
-    source_labels["taker_delta_source"] = source_labels.get("cvd_source")
+    source_labels["taker_delta_source"] = source_labels.get("taker_bucket_delta_source")
     forbidden_labels = [FORBIDDEN_LABELS.get(code, code) for code in forbidden]
     return {
         "market_direction": direction,

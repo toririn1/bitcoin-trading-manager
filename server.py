@@ -41,6 +41,7 @@ from indicators import add_all_indicators, fibonacci_swing_levels, fib_window_fo
 from analyzer import run_full_analysis
 from macro_fetcher import fetch_macro_context
 from time_utils import format_kst, now_kst
+from engine_v2.api.routes import register_v2_routes
 
 # ── Reflection / Memory (optional: rank_bm25 미설치 시 None) ──
 try:
@@ -93,6 +94,7 @@ FIB_COLORS = {
 }
 
 app = FastAPI()
+register_v2_routes(app, os.path.dirname(os.path.abspath(__file__)))
 # 분석(LLM API) + 데이터 fetch가 동시에 실행될 수 있도록 워커 수 충분히 확보
 # 기본 4개는 분석 1건만으로 전부 포화 → CPU 코어 × 4 또는 최소 16
 _executor = concurrent.futures.ThreadPoolExecutor(
