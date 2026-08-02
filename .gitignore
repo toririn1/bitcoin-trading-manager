@@ -1,0 +1,37 @@
+# API 키 — 절대 커밋 금지
+.env
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 로그
+*.log
+
+# Node.js
+node_modules/
+btc-dashboard/node_modules/
+
+# 로컬 데이터
+data/
