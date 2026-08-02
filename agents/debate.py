@@ -11,9 +11,8 @@ import time
 from dataclasses import dataclass, field, asdict
 from typing import Callable, Optional
 
-import anthropic
-
-from config import CLAUDE_API_KEY, CLAUDE_MODEL
+import config
+from llm_client import call_text_llm
 from .prompts import (
     BULL_SYSTEM,
     BEAR_SYSTEM,
@@ -83,30 +82,16 @@ ProgressCallback = Callable[[str, str], None]
 # progress_cb(phase, detail) — 예: ("bull_round_1", "Bull 라운드 1/1 시작")
 
 
-def _call_llm(client: anthropic.Anthropic, system: str, user: str) -> str:
-    """단일 에이전트 호출. 429/529 백오프 포함."""
-    max_retries = 3
-    wait = 8
-    for attempt in range(max_retries):
-        try:
-            msg = client.messages.create(
-                model=DEBATE_MODEL,
-                max_tokens=DEBATE_MAX_OUTPUT_TOKENS,
-                system=system,
-                messages=[{"role": "user", "content": user}],
-            )
-            if not hasattr(msg, "content") or not isinstance(msg.content, list):
-                raise RuntimeError(
-                    f"API 응답 형식 오류 — {type(msg).__name__}: {msg!r:.200}"
-                )
-            text = next((b.text for b in msg.content if b.type == "text"), "")
-            return text.strip()
-        except anthropic.APIStatusError as e:
-            if e.status_code in (429, 529) and attempt < max_retries - 1:
-                time.sleep(wait)
-                wait *= 2
-                continue
-            raise
+def _model_label() -> str:
+    return config.ANTHROPIC_MODEL if config.LLM_PROVIDER == "anthropic" else config.LLM_MODEL
+
+
+def _call_llm(system: str, user: str) -> str:
+    return call_text_llm(
+        system_prompt=system,
+        user_prompt=user,
+        max_tokens=DEBATE_MAX_OUTPUT_TOKENS,
+    )
 
 
 def run_bull_bear_debate(
@@ -137,13 +122,12 @@ def run_bull_bear_debate(
     """
     rounds = max_rounds if max_rounds is not None else DEBATE_MAX_ROUNDS
 
-    # 토론 비활성 또는 키 없음 → 빈 결과 반환 (analyzer 는 정상 진행)
+    # 토론 비활성 또는 LLM 설정 없음 → 빈 결과 반환 (analyzer 는 정상 진행)
     if not DEBATE_ENABLED:
         return DebateResult(enabled=False, rounds=0)
-    if not CLAUDE_API_KEY:
-        return DebateResult(enabled=False, rounds=0, error="CLAUDE_API_KEY 미설정")
+    if not config.llm_api_key_configured():
+        return DebateResult(enabled=False, rounds=0, error="LLM 설정 미완료")
 
-    client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     result = DebateResult(enabled=True, rounds=rounds)
 
     # 메모리 쿼리 — situation_tags 또는 context_blob 앞 200자
@@ -178,13 +162,13 @@ def run_bull_bear_debate(
                 ),
             )
             t0 = time.time()
-            bull_reply = _call_llm(client, BULL_SYSTEM, bull_user)
+            bull_reply = _call_llm(BULL_SYSTEM, bull_user)
             elapsed = time.time() - t0
             result.turns.append(DebateTurn(
                 side="bull",
                 round_index=r,
                 content=bull_reply,
-                model=DEBATE_MODEL,
+                model=_model_label(),
                 elapsed_s=round(elapsed, 2),
             ))
             last_bull = bull_reply
@@ -210,13 +194,13 @@ def run_bull_bear_debate(
                 ),
             )
             t0 = time.time()
-            bear_reply = _call_llm(client, BEAR_SYSTEM, bear_user)
+            bear_reply = _call_llm(BEAR_SYSTEM, bear_user)
             elapsed = time.time() - t0
             result.turns.append(DebateTurn(
                 side="bear",
                 round_index=r,
                 content=bear_reply,
-                model=DEBATE_MODEL,
+                model=_model_label(),
                 elapsed_s=round(elapsed, 2),
             ))
             last_bear = bear_reply
@@ -236,7 +220,7 @@ def run_bull_bear_debate(
 
 def format_debate_block(result: DebateResult) -> str:
     """
-    토론 결과를 최종 analyze_with_claude() 프롬프트에 주입할 텍스트 블록으로 변환.
+    토론 결과를 최종 analyze_with_llm() 프롬프트에 주입할 텍스트 블록으로 변환.
     토론이 비활성/실패면 빈 문자열 반환 → 기존 프롬프트 그대로 동작.
     """
     if not result.enabled:

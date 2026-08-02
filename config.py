@@ -20,8 +20,8 @@ def _safe_env(key: str, default: str = "") -> str:
 
     .env 파일에 개행문자(\\n, \\r)가 포함된 값이 있으면
     python-dotenv 가 추가 변수를 주입(CRLF Injection)할 수 있습니다.
-    예: CLAUDE_API_KEY=sk-xxx\\nANTHROPIC_BASE_URL=https://evil.com
-    → Claude SDK 가 공격자 서버로 API 키를 전송하는 취약점.
+    예: LLM_API_KEY=sk-xxx\\nLLM_BASE_URL=https://evil.com
+    → LLM SDK/HTTP client 가 공격자 서버로 API 키를 전송하는 취약점.
     이를 방지하기 위해 모든 env 값에서 개행문자를 제거합니다.
     """
     val = os.getenv(key, default) or default
@@ -69,14 +69,84 @@ def sanitize_env_value(value: object) -> str:
     return value.replace("\r", "").replace("\n", "").replace("\x00", "").strip()
 
 
-CLAUDE_API_KEY = _safe_env("CLAUDE_API_KEY")
-CLAUDE_MODEL   = _safe_env("CLAUDE_MODEL", "claude-sonnet-4-6")
+def _safe_int_env(key: str, default: int) -> int:
+    try:
+        return int(_safe_env(key, str(default)))
+    except Exception:
+        return default
+
+
+def _safe_bool_env(key: str, default: bool) -> bool:
+    raw = _safe_env(key, "true" if default else "false").lower()
+    return raw not in ("0", "false", "no", "off", "")
+
+
+_LEGACY_ANTHROPIC_KEY_ENV = "CLAUDE" + "_API_KEY"
+_LEGACY_ANTHROPIC_MODEL_ENV = "CLAUDE" + "_MODEL"
+ANTHROPIC_API_KEY = _safe_env("ANTHROPIC_API_KEY", _safe_env(_LEGACY_ANTHROPIC_KEY_ENV))
+ANTHROPIC_MODEL   = _safe_env("ANTHROPIC_MODEL", _safe_env(_LEGACY_ANTHROPIC_MODEL_ENV, "claude-sonnet-4-6"))
+
+_default_provider = "openai_oauth"
+LLM_PROVIDER     = _safe_env("LLM_PROVIDER", _default_provider).lower()
+LLM_BASE_URL     = _safe_env("LLM_BASE_URL", "http://127.0.0.1:10532/v1").rstrip("/")
+LLM_API_KEY      = _safe_env("LLM_API_KEY")
+LLM_MODEL        = _safe_env("LLM_MODEL", "gpt-5.6-sol")
+LLM_MAX_TOKENS   = int(_safe_env("LLM_MAX_TOKENS", _safe_env("ANALYST_MAX_TOKENS", "8000")) or "8000")
+LLM_TEMPERATURE  = float(_safe_env("LLM_TEMPERATURE", "0.2") or "0.2")
+LLM_TIMEOUT_SECS = float(_safe_env("LLM_TIMEOUT_SECS", "120") or "120")
+
+ANALYSIS_COOLDOWN_SECS = max(0, _safe_int_env("ANALYSIS_COOLDOWN_SECS", 0))
+ANALYSIS_DEBOUNCE_SECS = max(0, _safe_int_env("ANALYSIS_DEBOUNCE_SECS", 5))
+PREVENT_CONCURRENT_ANALYSIS = _safe_bool_env("PREVENT_CONCURRENT_ANALYSIS", True)
+
+def llm_api_key_configured() -> bool:
+    if LLM_PROVIDER == "openai_oauth":
+        return bool(LLM_BASE_URL and LLM_MODEL)
+    if LLM_PROVIDER == "anthropic":
+        return bool(ANTHROPIC_API_KEY)
+    return bool(LLM_API_KEY)
 
 BINANCE_BASE_URL    = "https://api.binance.com"
 BINANCE_FUTURES_URL = "https://fapi.binance.com"
 BINANCE_API_KEY     = _safe_env("BINANCE_API_KEY")
 BINANCE_SECRET_KEY  = _safe_env("BINANCE_SECRET_KEY")
 DEFAULT_SYMBOL      = _safe_env("DEFAULT_SYMBOL", "BTCUSDT").upper()
+
+# ── Gate.io 계좌 연동 ─────────────────────────
+# ACCOUNT_PROVIDER: "gateio" | "binance" | "none"
+ACCOUNT_PROVIDER         = _safe_env("ACCOUNT_PROVIDER", "none").lower()
+ACCOUNT_FEATURES_ENABLED = _safe_bool_env("ACCOUNT_FEATURES_ENABLED", False)
+ACCOUNT_INCLUDE_IN_LLM   = _safe_bool_env("ACCOUNT_INCLUDE_IN_LLM", False)
+GATE_BASE_URL            = _safe_env("GATE_BASE_URL", "https://api.gateio.ws/api/v4").rstrip("/")
+GATE_SETTLE              = _safe_env("GATE_SETTLE", "usdt").lower()
+GATE_API_KEY             = _safe_env("GATE_API_KEY")
+GATE_API_SECRET          = _safe_env("GATE_API_SECRET")
+# GATE_ACCOUNT_READONLY=1 은 의도적 설정 선언용 (코드 내에서 변경 시도 방지)
+GATE_ACCOUNT_READONLY    = _safe_bool_env("GATE_ACCOUNT_READONLY", True)
+# Spot 권한 키 (선택): Affiliate Ultra Commission Self-Rebate 조회용
+# 설정 안 하면 GATE_API_KEY 로 시도 (spot 권한 없으면 graceful 처리)
+GATE_SPOT_API_KEY        = _safe_env("GATE_SPOT_API_KEY") or _safe_env("GATE_API_KEY")
+GATE_SPOT_API_SECRET     = _safe_env("GATE_SPOT_API_SECRET") or _safe_env("GATE_API_SECRET")
+GATE_REBATE_RATE         = max(0.0, min(1.0, float(_safe_env("GATE_REBATE_RATE", "0.70") or "0.70")))
+
+# Decision-support policy. Gross fee is displayed as a warning; the conservative
+# net fee ratio (confirmed rebates + a fraction of pending rebates) drives tiers.
+FEE_TO_EQUITY_REDUCE_THRESHOLD = float(_safe_env("FEE_TO_EQUITY_REDUCE_THRESHOLD", "0.02") or "0.02")
+FEE_TO_EQUITY_BLOCK_THRESHOLD  = float(_safe_env("FEE_TO_EQUITY_BLOCK_THRESHOLD", "0.05") or "0.05")
+HARD_BLOCK_THRESHOLD           = float(_safe_env("HARD_BLOCK_THRESHOLD", "0.10") or "0.10")
+EXPECTED_REBATE_RECOGNITION    = max(0.0, min(1.0, float(_safe_env("EXPECTED_REBATE_RECOGNITION", "0.50") or "0.50")))
+SETUP_MIN_RR                   = max(0.1, float(_safe_env("SETUP_MIN_RR", "1.20") or "1.20"))
+NEARBY_LEVEL_PCT               = max(0.0, float(_safe_env("NEARBY_LEVEL_PCT", "0.005") or "0.005"))
+
+
+def gate_key_configured() -> bool:
+    """Gate API key/secret 이 실제로 설정되어 있는지 여부."""
+    return bool(GATE_API_KEY and GATE_API_SECRET)
+
+
+def gate_spot_key_configured() -> bool:
+    """Gate spot 전용 key/secret이 설정되어 있는지 여부."""
+    return bool(GATE_SPOT_API_KEY and GATE_SPOT_API_SECRET)
 
 
 def symbol_to_pair(symbol: str) -> str:

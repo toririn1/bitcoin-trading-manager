@@ -21,12 +21,10 @@ from __future__ import annotations
 
 import os
 import re
-import time
 from typing import Any, Optional
 
-import anthropic
-
-from config import CLAUDE_API_KEY
+import config
+from llm_client import call_text_llm
 
 
 CONSISTENCY_LLM_ENABLED = (
@@ -228,7 +226,7 @@ def _llm_consistency_check(
     analysis_json: dict, report_text: str
 ) -> Optional[dict]:
     """짧은 Haiku 콜로 JSON ↔ 본문 의미 일치 검증."""
-    if not CONSISTENCY_LLM_ENABLED or not CLAUDE_API_KEY:
+    if not CONSISTENCY_LLM_ENABLED or not config.llm_api_key_configured():
         return None
     try:
         import json as _json
@@ -238,14 +236,11 @@ def _llm_consistency_check(
     report_snippet = (report_text or "")[:2500]
     user = _LLM_USER_TEMPLATE.format(json_repr=json_repr, report_text=report_snippet)
     try:
-        client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-        msg = client.messages.create(
-            model=CONSISTENCY_LLM_MODEL,
+        text = call_text_llm(
+            system_prompt=_LLM_SYSTEM,
+            user_prompt=user,
             max_tokens=CONSISTENCY_LLM_MAX_TOKENS,
-            system=_LLM_SYSTEM,
-            messages=[{"role": "user", "content": user}],
         )
-        text = next((b.text for b in msg.content if b.type == "text"), "").strip()
     except Exception as exc:
         return {"status": "error", "issues": [f"LLM 검증 호출 실패 — {exc}"]}
 

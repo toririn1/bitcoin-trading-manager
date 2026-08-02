@@ -29,9 +29,16 @@ from account_context import (
     keepalive_user_data_stream,
     open_user_data_stream,
 )
+from account_performance import (
+    build_asset_basis,
+    build_daily_performance,
+    normalized_performance_snapshots,
+)
+from decision_bridge import ensure_api_compatibility
+from analysis_performance import evaluate_analysis_record
 from data_fetcher import fetch_ohlcv, fetch_current_price
 from indicators import add_all_indicators, fibonacci_swing_levels, fib_window_for_tf
-from analyzer import analyze_with_claude, run_full_analysis
+from analyzer import run_full_analysis
 from macro_fetcher import fetch_macro_context
 from time_utils import format_kst, now_kst
 
@@ -86,7 +93,7 @@ FIB_COLORS = {
 }
 
 app = FastAPI()
-# 분석(Claude API) + 데이터 fetch가 동시에 실행될 수 있도록 워커 수 충분히 확보
+# 분석(LLM API) + 데이터 fetch가 동시에 실행될 수 있도록 워커 수 충분히 확보
 # 기본 4개는 분석 1건만으로 전부 포화 → CPU 코어 × 4 또는 최소 16
 _executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=max(16, (os.cpu_count() or 4) * 4)
@@ -224,6 +231,7 @@ def _persist_analysis_history(payload: dict):
             "report_generated_from_json": payload.get("report_generated_from_json"),
             "analysis_adjustments": payload.get("analysis_adjustments"),
             "consistency": payload.get("consistency"),
+            **evaluate_analysis_record({"price": payload.get("price"), "signal": payload.get("signal"), "trade_levels": payload.get("trade_levels")}, None),
         }
         with open(ANALYSIS_HISTORY_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -471,7 +479,7 @@ def build_market_payload(
 
 def _build_payload(tf_data: dict, price: float, analysis: dict) -> dict:
     payload = build_market_payload(tf_data, price, include_overview=True)
-    return {
+    return ensure_api_compatibility({
         **payload,
         "analysis_time": _now_label(),
         "signal":       analysis["signal"],
@@ -488,6 +496,7 @@ def _build_payload(tf_data: dict, price: float, analysis: dict) -> dict:
         "consistency": analysis.get("consistency"),
         # 구조화 트레이딩 시그널 (signal_processing.TradingSignal.to_dict())
         "trading_signal": analysis.get("trading_signal"),
+        "llm_leverage": analysis.get("llm_leverage"),
         "claude_leverage": analysis.get("claude_leverage"),
         # Bull/Bear 사전 토론 결과
         "debate": analysis.get("debate"),
@@ -498,7 +507,8 @@ def _build_payload(tf_data: dict, price: float, analysis: dict) -> dict:
         # 과거 유사 상황 (BM25 회상 결과)
         "memories": analysis.get("memories", []),
         # account 는 account-stream 에서 실시간으로 별도 관리 — 여기서 포함하지 않음
-    }
+        "decision_support": analysis.get("decision_support", {}),
+    })
 
 
 class MarketStreamManager:
@@ -772,7 +782,7 @@ class MarketStreamManager:
           3) 초당 4회 지표 계산 → 이벤트 루프 과부하 → 실시간 가격 지연의 근본 원인.
 
         미확정 캔들은 OHLCV만 tf_data에 업데이트 (지표 계산 없이 빠르게).
-        → 분석 실행 시 최신 OHLCV가 포함된 상태로 지표를 재계산해서 Claude에 전달.
+        → 분석 실행 시 최신 OHLCV가 포함된 상태로 지표를 재계산해서 LLM에 전달.
         확정 빈도: 15m=15분, 1h=1시간, 4h=4시간, 1d=1일 → 하루 총 수십 회.
         """
         tf = kline.get("i")
@@ -1056,6 +1066,15 @@ class AccountStreamManager:
                     await asyncio.sleep(5)
                     continue
 
+            # Gate.io provider: WebSocket 불필요 — REST 폴링만 사용
+            if runtime_config.ACCOUNT_PROVIDER == "gateio":
+                await asyncio.sleep(ACCOUNT_PERIODIC_REFRESH_SECS)
+                continue
+
+            if not runtime_config.ACCOUNT_FEATURES_ENABLED or runtime_config.ACCOUNT_PROVIDER == "none":
+                await asyncio.sleep(60)
+                continue
+
             if not runtime_config.BINANCE_API_KEY:
                 await asyncio.sleep(30)
                 continue
@@ -1084,6 +1103,14 @@ class AccountStreamManager:
             await asyncio.sleep(ACCOUNT_PERIODIC_REFRESH_SECS)
             if self._stopped:
                 break
+            if not runtime_config.ACCOUNT_FEATURES_ENABLED or runtime_config.ACCOUNT_PROVIDER == "none":
+                continue
+            if runtime_config.ACCOUNT_PROVIDER == "gateio":
+                if not runtime_config.gate_key_configured():
+                    continue
+                with contextlib.suppress(Exception):
+                    await self._refresh_payload(delay=0, broadcast=True)
+                continue
             if not runtime_config.BINANCE_API_KEY:
                 continue
             with contextlib.suppress(Exception):
@@ -1233,16 +1260,32 @@ class MacroSnapshotManager:
 _macro_snapshot = MacroSnapshotManager()
 
 
-# 수동 분석 버튼 쿨다운: 10분
-MANUAL_COOLDOWN_SECS = 60 * 60
+# 수동 분석 버튼 쿨다운: 개인 로컬 기본값은 0초
 MANUAL_COOLDOWN_STATE_PATH = os.path.join(BASE_DIR, "data", "manual_cooldown.json")
 
 
+def _analysis_cooldown_secs() -> int:
+    return int(getattr(runtime_config, "ANALYSIS_COOLDOWN_SECS", 0) or 0)
+
+
+def _analysis_debounce_secs() -> int:
+    return int(getattr(runtime_config, "ANALYSIS_DEBOUNCE_SECS", 5) or 0)
+
+
+def _prevent_concurrent_analysis() -> bool:
+    return bool(getattr(runtime_config, "PREVENT_CONCURRENT_ANALYSIS", True))
+
+
 def _load_manual_cooldown_time() -> float:
-    """서버 재시작 후 수동 클릭 시각을 복원. 없으면 0.0 반환."""
+    """서버 재시작 후 마지막 수동 분석 완료 시각을 복원. 없으면 0.0 반환."""
     try:
         with open(MANUAL_COOLDOWN_STATE_PATH, "r", encoding="utf-8") as f:
-            return float(json.load(f).get("last_manual_started_at", 0.0))
+            data = json.load(f)
+            return float(
+                data.get("last_manual_finished_at")
+                or data.get("last_manual_started_at")
+                or 0.0
+            )
     except Exception:
         return 0.0
 
@@ -1251,7 +1294,7 @@ def _save_manual_cooldown_time(ts: float) -> None:
     try:
         os.makedirs(os.path.dirname(MANUAL_COOLDOWN_STATE_PATH), exist_ok=True)
         with open(MANUAL_COOLDOWN_STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump({"last_manual_started_at": ts}, f)
+            json.dump({"last_manual_finished_at": ts}, f)
     except Exception as exc:
         import logging as _log
         _log.getLogger(__name__).warning("manual cooldown 저장 실패 — %s", exc)
@@ -1268,7 +1311,24 @@ class AnalysisManager:
         self._latest_result_json: str | None = (
             json.dumps(_lr, ensure_ascii=False) if _lr is not None else None
         )
-        self._last_manual_started_at: float = _load_manual_cooldown_time()
+        self._last_manual_finished_at: float = _load_manual_cooldown_time()
+
+    def _cooldown_remaining_secs(self) -> int:
+        cooldown = _analysis_cooldown_secs()
+        if cooldown <= 0:
+            return 0
+        return int(max(0.0, cooldown - (time.time() - self._last_manual_finished_at)))
+
+    def _next_analysis_available_at(self) -> str | None:
+        cooldown = _analysis_cooldown_secs()
+        remaining = self._cooldown_remaining_secs()
+        if cooldown <= 0 or remaining <= 0:
+            return None
+        import datetime as _dt
+        return _dt.datetime.fromtimestamp(
+            time.time() + remaining,
+            tz=_dt.timezone.utc,
+        ).isoformat()
 
     async def stop(self):
         task = None
@@ -1282,21 +1342,29 @@ class AnalysisManager:
     async def start_job(self, bypass_cooldown: bool = False) -> tuple[dict, bool]:
         async with self._lock:
             if self._job and self._job["status"] in {"pending", "running"}:
+                if _prevent_concurrent_analysis() and not bypass_cooldown:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "reason": "analysis_running",
+                            "message": "이미 분석이 진행 중입니다.",
+                            "job": self._serialize_job(self._job),
+                        },
+                    )
                 return self._serialize_job(self._job), False
 
             # 쿨다운 체크 (스케줄러는 bypass)
             if not bypass_cooldown:
-                remaining = max(0.0, MANUAL_COOLDOWN_SECS - (time.time() - self._last_manual_started_at))
+                remaining = self._cooldown_remaining_secs()
                 if remaining > 0:
                     raise HTTPException(
                         status_code=429,
                         detail={
                             "reason": "cooldown",
                             "cooldown_remaining_secs": int(remaining),
+                            "next_analysis_available_at": self._next_analysis_available_at(),
                         },
                     )
-                self._last_manual_started_at = time.time()
-                _save_manual_cooldown_time(self._last_manual_started_at)
 
             started_at = _now_iso()
             job = {
@@ -1322,9 +1390,15 @@ class AnalysisManager:
 
     async def get_status(self, include_latest: bool = False) -> dict:
         async with self._lock:
+            running = bool(self._job and self._job["status"] in {"pending", "running"})
             response = {
                 "job": self._serialize_job(self._job),
-                "cooldown_remaining_secs": int(max(0.0, MANUAL_COOLDOWN_SECS - (time.time() - self._last_manual_started_at))),
+                "cooldown_remaining_secs": self._cooldown_remaining_secs(),
+                "analysis_cooldown_secs": _analysis_cooldown_secs(),
+                "analysis_debounce_secs": _analysis_debounce_secs(),
+                "prevent_concurrent_analysis": _prevent_concurrent_analysis(),
+                "analysis_running": running,
+                "next_analysis_available_at": self._next_analysis_available_at(),
             }
             if (
                 self._job
@@ -1376,6 +1450,7 @@ class AnalysisManager:
 
     async def _complete(self, job_id: str, payload: dict):
         completed_at = _now_iso()
+        completed_ts = time.time()
         async with self._lock:
             if not self._job or self._job["id"] != job_id:
                 return
@@ -1387,6 +1462,8 @@ class AnalysisManager:
             self._job["completed_at"] = completed_at
             self._latest_result = copy.deepcopy(payload)
             self._latest_result_json = json.dumps(self._latest_result, ensure_ascii=False)
+            self._last_manual_finished_at = completed_ts
+            _save_manual_cooldown_time(completed_ts)
 
     async def _fail(self, job_id: str, message: str, status: str = "error"):
         failed_at = _now_iso()
@@ -1465,12 +1542,14 @@ import datetime as _dt
 SCHEDULE_STATE_PATH = os.path.join(BASE_DIR, "data", "schedule_state.json")
 
 class ScheduleManager:
-    """서버에서 30분마다 분석을 실행하는 백그라운드 스케줄러."""
+    """자동 AI 분석 백그라운드 스케줄러. 주기는 동적으로 변경 가능."""
 
-    INTERVAL_MIN = 240  # 고정 4시간
+    _VALID_INTERVALS = {30, 60, 120, 240}  # 허용 주기 (분)
+    DEFAULT_INTERVAL_MIN = 30
 
     def __init__(self):
         self._enabled: bool = False
+        self._interval_min: int = self.DEFAULT_INTERVAL_MIN
         self._next_run_at: str | None = None
         self._task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
@@ -1483,6 +1562,9 @@ class ScheduleManager:
                 with open(SCHEDULE_STATE_PATH, "r", encoding="utf-8") as f:
                     saved = json.load(f)
                 self._enabled = bool(saved.get("enabled", False))
+                saved_interval = int(saved.get("interval_min", self.DEFAULT_INTERVAL_MIN))
+                if saved_interval in self._VALID_INTERVALS:
+                    self._interval_min = saved_interval
         except Exception:
             pass
 
@@ -1490,20 +1572,22 @@ class ScheduleManager:
         try:
             os.makedirs(os.path.dirname(SCHEDULE_STATE_PATH), exist_ok=True)
             with open(SCHEDULE_STATE_PATH, "w", encoding="utf-8") as f:
-                json.dump({"enabled": self._enabled, "interval_min": self.INTERVAL_MIN}, f)
+                json.dump({"enabled": self._enabled, "interval_min": self._interval_min}, f)
         except Exception:
             pass
 
     def status(self) -> dict:
         return {
             "enabled":      self._enabled,
-            "interval_min": self.INTERVAL_MIN,
+            "interval_min": self._interval_min,
             "next_run_at":  self._next_run_at,
         }
 
-    async def set_schedule(self, enabled: bool, interval_min: int = INTERVAL_MIN):
+    async def set_schedule(self, enabled: bool, interval_min: int = DEFAULT_INTERVAL_MIN):
         async with self._lock:
             self._enabled = enabled
+            if interval_min in self._VALID_INTERVALS:
+                self._interval_min = interval_min
             self._save_state()
             await self._restart_task()
 
@@ -1528,7 +1612,7 @@ class ScheduleManager:
 
     async def _loop(self):
         while True:
-            wait_sec = self.INTERVAL_MIN * 60
+            wait_sec = self._interval_min * 60
             next_dt  = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=wait_sec)
             self._next_run_at = next_dt.isoformat()
             try:
@@ -1654,6 +1738,22 @@ async def connections():
     return {"count": count}
 
 
+@app.get("/health")
+async def health():
+    analysis_status = await _analysis_manager.get_status(include_latest=False)
+    return {
+        "ok": True,
+        "llm_provider": runtime_config.LLM_PROVIDER,
+        "llm_configured": runtime_config.llm_api_key_configured(),
+        "binance_configured": bool(runtime_config.BINANCE_API_KEY and runtime_config.BINANCE_SECRET_KEY),
+        "analysis_cooldown_secs": analysis_status["analysis_cooldown_secs"],
+        "analysis_debounce_secs": analysis_status["analysis_debounce_secs"],
+        "prevent_concurrent_analysis": analysis_status["prevent_concurrent_analysis"],
+        "analysis_running": analysis_status["analysis_running"],
+        "next_analysis_available_at": analysis_status["next_analysis_available_at"],
+    }
+
+
 @app.get("/api/debug/price")
 async def debug_price():
     """WebSocket 연결 상태 및 현재 가격 진단용 엔드포인트."""
@@ -1695,12 +1795,13 @@ async def schedule_get():
 
 class ScheduleSetRequest(BaseModel):
     enabled: bool
+    interval_min: int = 30
 
 
 @app.post("/api/schedule")
 async def schedule_set(body: ScheduleSetRequest):
-    """자동분석 스케줄 설정. enabled=true/false 로 30분 타이머를 제어."""
-    await _schedule_manager.set_schedule(body.enabled)
+    """자동분석 스케줄 설정. enabled=true/false, interval_min=30|60|120|240 으로 타이머를 제어."""
+    await _schedule_manager.set_schedule(body.enabled, body.interval_min)
     return _schedule_manager.status()
 
 
@@ -1714,6 +1815,12 @@ async def analyze_start(
     body: AnalyzeRequest | None = None,
     password: str | None = None,  # 하위 호환: 쿼리스트링으로도 일시적으로 허용
 ):
+    import config as _cfg
+    if not _cfg.llm_api_key_configured():
+        raise HTTPException(
+            status_code=400,
+            detail="LLM API 키가 없습니다. 설정에서 Provider와 LLM API Key를 저장한 뒤 분석을 실행하세요.",
+        )
     # body 우선, 없으면 쿼리스트링 (레거시) — 둘 다 비어있으면 일반 분석
     supplied = (body.password if body else None) or password
     bypass = False
@@ -1920,13 +2027,26 @@ async def setup_status():
     값이 채워져 있는지만 확인 — 실제 유효성 검증은 하지 않음.
     """
     import config as _cfg
+    analysis_status = await _analysis_manager.get_status(include_latest=False)
     return {
-        "claude":   bool(_cfg.CLAUDE_API_KEY),
+        "llm":      _cfg.llm_api_key_configured(),
+        "provider": _cfg.LLM_PROVIDER,
+        "base_url": _cfg.LLM_BASE_URL,
+        "model":    _cfg.ANTHROPIC_MODEL if _cfg.LLM_PROVIDER == "anthropic" else _cfg.LLM_MODEL,
         "binance":  bool(_cfg.BINANCE_API_KEY and _cfg.BINANCE_SECRET_KEY),
+        "analysis_cooldown_secs": analysis_status["analysis_cooldown_secs"],
+        "analysis_debounce_secs": analysis_status["analysis_debounce_secs"],
+        "prevent_concurrent_analysis": analysis_status["prevent_concurrent_analysis"],
+        "analysis_running": analysis_status["analysis_running"],
+        "next_analysis_available_at": analysis_status["next_analysis_available_at"],
     }
 
 
 class SetupSaveRequest(BaseModel):
+    llm_provider:       str = "openai_oauth"
+    llm_base_url:       str = ""
+    llm_api_key:        str = ""
+    llm_model:          str = ""
     claude_api_key:     str = ""
     binance_api_key:    str = ""
     binance_secret_key: str = ""
@@ -1968,7 +2088,12 @@ async def setup_save(body: SetupSaveRequest, request: Request):
 
     # 새 값 병합 — CRLF/NUL 제거하여 .env 파일 오염/환경변수 주입 방지
     updates = {
-        "CLAUDE_API_KEY":     runtime_config.sanitize_env_value(body.claude_api_key),
+        "LLM_PROVIDER":       runtime_config.sanitize_env_value(body.llm_provider),
+        "LLM_BASE_URL":       runtime_config.sanitize_env_value(body.llm_base_url),
+        "LLM_API_KEY":        runtime_config.sanitize_env_value(body.llm_api_key),
+        "LLM_MODEL":          runtime_config.sanitize_env_value(body.llm_model),
+        "ANTHROPIC_API_KEY":  runtime_config.sanitize_env_value(body.claude_api_key),
+        "ANTHROPIC_MODEL":    runtime_config.sanitize_env_value(body.llm_model),
         "BINANCE_API_KEY":    runtime_config.sanitize_env_value(body.binance_api_key),
         "BINANCE_SECRET_KEY": runtime_config.sanitize_env_value(body.binance_secret_key),
     }
@@ -2021,14 +2146,19 @@ async def analysis_history_endpoint(limit: int = 100):
 
 @app.get("/api/performance")
 async def performance_endpoint(days: int = 30):
-    """account_history.jsonl 기반 성과 지표 반환."""
+    """account_history.jsonl 기반 성과 지표 반환.
+
+    Gate는 Total Assets 스냅샷을 성과 기준으로 정규화한다. 공개 API에는
+    Gate 웹 Assets Analysis/PnL Calendar 원본 히스토리 엔드포인트가 없어,
+    서버가 관측한 /wallet/total_balance 기반 스냅샷을 사용한다.
+    """
     from datetime import datetime, timezone, timedelta
-    # 방어적 경계 — 최대 1년, 최소 1일.
+
     days = max(1, min(days, 365))
     history_path = os.path.join(BASE_DIR, "data", "account_history.jsonl")
-    # cutoff 를 먼저 계산하여 파싱 단계에서 바로 필터링 → 메모리 사용량 절감
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).timestamp()
-    snapshots: list = []
+    raw_entries: list[dict] = []
+
     try:
         if os.path.exists(history_path):
             with open(history_path, "r", encoding="utf-8") as f:
@@ -2041,45 +2171,171 @@ async def performance_endpoint(days: int = 30):
                     except Exception:
                         continue
                     if (entry.get("observed_ts") or 0) >= cutoff:
-                        snapshots.append(entry)
+                        raw_entries.append(entry)
+        snapshots, diagnostics = normalized_performance_snapshots(
+            raw_entries,
+            runtime_config.ACCOUNT_PROVIDER,
+        )
     except Exception as exc:
-        return {"error": str(exc), "snapshots": [], "daily": []}
+        return {
+            "status": "error",
+            "error": str(exc),
+            "snapshots": [],
+            "daily": [],
+            "provider": runtime_config.ACCOUNT_PROVIDER,
+            "legacy_excluded_count": 0,
+            "polluted_excluded_count": 0,
+        }
 
-    # 일별 집계 (KST 기준 날짜로 그룹)
-    from collections import defaultdict
-    from time_utils import format_kst
-    daily_map: dict = defaultdict(list)
-    for snap in snapshots:
+    if not snapshots:
+        return {
+            "status": "no_data",
+            "message": "스냅샷 데이터 부족 — 서버 실행 후 축적됩니다.",
+            "snapshots": [],
+            "daily": [],
+            "provider": runtime_config.ACCOUNT_PROVIDER,
+            "source": "gate_total_assets" if runtime_config.ACCOUNT_PROVIDER == "gateio" else "account_history",
+            "source_detail": (
+                "observed_wallet_total_balance" if runtime_config.ACCOUNT_PROVIDER == "gateio"
+                else "account_history"
+            ),
+            "timezone": "UTC" if runtime_config.ACCOUNT_PROVIDER == "gateio" else "KST",
+            **diagnostics,
+        }
+
+    provider = runtime_config.ACCOUNT_PROVIDER
+    daily = build_daily_performance(snapshots, provider)
+
+    return {
+        "status": "ok",
+        "snapshots": snapshots,
+        "daily": daily,
+        "provider": provider,
+        "source": "gate_total_assets" if provider == "gateio" else "account_history",
+        "source_detail": "observed_wallet_total_balance" if provider == "gateio" else "account_history",
+        "timezone": "UTC" if provider == "gateio" else "KST",
+        "asset_basis": build_asset_basis(snapshots) if provider == "gateio" else None,
+        **diagnostics,
+    }
+
+@app.get("/api/performance/pnl_history")
+async def performance_pnl_history(days: int = 30, include_point_fee: bool = False):
+    """Gate.io account_book 기반 일별 실현손익 히스토리.
+
+    Gate.io provider일 때만 실제 데이터를 반환.
+    다른 provider이면 provider 필드와 빈 daily를 반환.
+    key/secret/sign/header는 응답에 포함하지 않는다.
+    """
+    days = max(1, min(days, 90))
+    provider = runtime_config.ACCOUNT_PROVIDER
+
+    if provider != "gateio":
+        return {
+            "status": "not_supported",
+            "provider": provider,
+            "message": f"{provider} provider는 account_book 히스토리를 지원하지 않습니다.",
+            "daily": [],
+        }
+
+    if not runtime_config.gate_key_configured():
+        return {
+            "status": "no_key",
+            "provider": "gateio",
+            "message": "Gate.io API 키가 설정되지 않았습니다.",
+            "daily": [],
+        }
+
+    try:
+        from account_providers.gateio import aggregate_daily_pnl
+        daily = await asyncio.to_thread(
+            aggregate_daily_pnl,
+            runtime_config.GATE_BASE_URL,
+            runtime_config.GATE_API_KEY,
+            runtime_config.GATE_API_SECRET,
+            runtime_config.GATE_SETTLE,
+            days,
+            include_point_fee,
+        )
+        return {
+            "status": "ok",
+            "provider": "gateio",
+            "days": days,
+            "daily": daily,
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "provider": "gateio",
+            "message": "Gate.io account_book 조회 실패",
+            "daily": [],
+        }
+
+
+@app.get("/api/gate/realized-pnl")
+async def gate_realized_pnl(days: int = 30, ledger_limit: int = 200):
+    """Gate.io account_book + spot self-rebate + position_close 기반 실제 손익표.
+
+    - 실현손익 기준: futures account_book (pnl/fee/fund/refr)
+    - self_rebate: spot/account_book?code=3341 (Affiliate Ultra Commission Self-Rebate)
+    - 순손익 = pnl + fee + fund + refr + self_rebate  (dnw 제외)
+    - key/secret/sign/header는 응답에 포함하지 않음
+    """
+    days = max(1, min(days, 90))
+    ledger_limit = max(10, min(ledger_limit, 500))
+
+    if not runtime_config.gate_key_configured():
+        return {
+            "status": "no_key",
+            "provider": "gateio",
+            "message": "Gate.io API 키가 설정되지 않았습니다.",
+            "summary": {}, "daily": [], "ledger": [], "position_closes": [],
+        }
+
+    try:
+        from account_providers.gateio import get_realized_pnl_report
+        report = await asyncio.to_thread(
+            get_realized_pnl_report,
+            runtime_config.GATE_BASE_URL,
+            runtime_config.GATE_API_KEY,
+            runtime_config.GATE_API_SECRET,
+            runtime_config.GATE_SETTLE,
+            days,
+            ledger_limit,
+            runtime_config.GATE_SPOT_API_KEY,
+            runtime_config.GATE_SPOT_API_SECRET,
+        )
+        # Gate Assets Analysis / Total Assets 화면과 비교할 수 있는 별도 기준.
+        # 장부 손익(account_book)은 미실현/잔고 이동/현물 가치 변화를 제외하므로
+        # total assets 변화와 숫자가 다를 수 있다.
         try:
-            dt = datetime.fromtimestamp(snap["observed_ts"], tz=timezone.utc)
-            day_key = format_kst(dt, "%Y-%m-%d")
-            daily_map[day_key].append(snap)
+            history_path = os.path.join(BASE_DIR, "data", "account_history.jsonl")
+            now_ts = time.time()
+            from_ts = now_ts - days * 86400
+            raw_entries: list[dict] = []
+            if os.path.exists(history_path):
+                with open(history_path, "r", encoding="utf-8") as f:
+                    for raw in f:
+                        try:
+                            snap = json.loads(raw)
+                            ts = float(snap.get("observed_ts") or 0)
+                        except Exception:
+                            continue
+                        if ts >= from_ts:
+                            raw_entries.append(snap)
+            asset_snaps, _asset_diag = normalized_performance_snapshots(raw_entries, "gateio")
+            report["asset_basis"] = build_asset_basis(asset_snaps)
         except Exception:
-            pass
-
-    daily = []
-    for day_key in sorted(daily_map.keys()):
-        day_snaps = daily_map[day_key]
-        # 당일 마지막 스냅샷 기준
-        last = day_snaps[-1]
-        first = day_snaps[0]
-        pnl_vals = [s.get("today_total_pnl") for s in day_snaps if s.get("today_total_pnl") is not None]
-        eq_vals  = [s.get("account_equity")  for s in day_snaps if s.get("account_equity")  is not None]
-        daily.append({
-            "date":           day_key,
-            "pnl":            last.get("today_total_pnl"),
-            "pnl_pct":        last.get("today_pnl_pct"),
-            "equity_start":   first.get("account_equity"),
-            "equity_end":     last.get("account_equity"),
-            "equity_high":    max(eq_vals)  if eq_vals  else None,
-            "equity_low":     min(eq_vals)  if eq_vals  else None,
-            "pnl_high":       max(pnl_vals) if pnl_vals else None,
-            "pnl_low":        min(pnl_vals) if pnl_vals else None,
-            "risk_status":    last.get("risk_status"),
-            "snap_count":     len(day_snaps),
-        })
-
-    return {"snapshots": snapshots, "daily": daily}
+            report["asset_basis"] = {"status": "error"}
+        return {"status": "ok", **report}
+    except Exception as exc:
+        import logging as _log
+        _log.getLogger(__name__).warning("Gate realized-pnl error: %s", type(exc).__name__)
+        return {
+            "status": "error",
+            "provider": "gateio",
+            "message": "Gate.io 실제 손익표 조회 실패",
+            "summary": {}, "daily": [], "ledger": [], "position_closes": [],
+        }
 
 
 # ══════════════════════════════════════════════

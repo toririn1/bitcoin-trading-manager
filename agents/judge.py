@@ -17,9 +17,8 @@ import time
 from dataclasses import dataclass, asdict, field
 from typing import Callable, Optional
 
-import anthropic
-
-from config import CLAUDE_API_KEY
+import config
+from llm_client import call_text_llm
 
 try:
     from .memory import AgentMemories
@@ -38,6 +37,7 @@ JUDGE_ENABLED = os.getenv("JUDGE_ENABLED", "1") not in ("0", "false", "False", "
 JUDGE_MAX_OUTPUT_TOKENS = int(os.getenv("JUDGE_MAX_OUTPUT_TOKENS", "1500"))
 
 JUDGE_SYSTEM = """당신은 BTC 선물 시장의 'Investment Judge(투자 심판)'입니다.
+시장 판단·setup 품질·계좌 실행 허가·최종 행동을 서로 다른 계층으로 판정하세요.
 역할: Bull Researcher 와 Bear Researcher 의 토론을 공정하게 듣고,
 어느 쪽의 논리가 현재 데이터에 더 잘 부합하는지 판정한 뒤 명확한 방향성 결론을 내립니다.
 
@@ -50,16 +50,28 @@ JUDGE_SYSTEM = """당신은 BTC 선물 시장의 'Investment Judge(투자 심판
    'Bull 의 핵심 근거 한 줄 / Bear 의 핵심 근거 한 줄' 을 마지막에 요약.
 6. 점수는 -2~+2 정수로만 평가하세요. +2는 해당 축이 판정 방향을 강하게 지지,
    0은 중립/불충분, -2는 판정 방향에 강하게 반대한다는 뜻입니다.
+7. 계좌 제한 때문에 시장 방향이나 setup을 중립·no_edge·no_trade로 덮어쓰지 마세요.
+8. blocked/hard_block은 계좌 기준 신규 실행만 제한합니다. 데이터 무결성 오류가 아니면 기존 포지션 축소·청산은 허용 가능한 행동으로 남기세요.
+9. 금융 조언 회피성 문구 없이 단호하게 판정하되, 수치·트리거·무효화 조건은 데이터에서만 가져오세요.
 
-출력 형식 (반드시 준수 — 정확히 5줄, 라벨 표기 그대로):
+출력 형식 (반드시 준수 — 라벨 표기 그대로):
 판정: [상방 우위 / 하방 우위 / 중립]
+시장 확신: [0~100 정수]
+시장 레짐: [한 줄]
+무효화: [가격 또는 조건 한 줄]
+Setup action: [enter_long_now / enter_short_now / wait_for_trigger / no_edge 등]
+진입 기대값: [poor / acceptable / conditional_good / good / excellent]
+계좌 실행 허가: [allow / reduce_size_only / manual_confirm_required / cooldown_required / blocked / hard_block]
+계좌 제한 이유: [한 줄]
+금지 행동: [쉼표 구분]
+Final action: [setup과 계좌 오버레이를 합성한 한 줄]
 점수: price_structure=0, momentum=0, derivatives=0, macro=0, account_risk_fit=0, counter_scenario=0
 이유: [2~3줄 구체적 근거 — 가격 구조·파생·거시 중 최소 2축 인용]
 Bull 핵심: [한 줄, 60~120자]
 Bear 핵심: [한 줄, 60~120자]
 
 분량 규칙:
-- 전체 350~600자. 'Bull 핵심', 'Bear 핵심' 라벨이 빠지거나 문장이 중간에서 끊기지 않도록 분량을 사전에 조절하세요.
+- 전체 600~1000자. 모든 라벨이 빠지거나 문장이 중간에서 끊기지 않도록 분량을 사전에 조절하세요.
 - HTML 금지. 마크다운(**굵게**)은 핵심 강조에 한해 허용 (### 헤더·--- 가로줄은 출력 형식이 깨지므로 금지)."""
 
 JUDGE_USER_TEMPLATE = """{pair_label} 현재 데이터 및 Bull/Bear 토론 결과입니다.
@@ -91,6 +103,11 @@ class JudgeResult:
     bear_key: str       # Bear 핵심 근거 한 줄
     raw_text: str       # LLM 원본 출력
     rubric_scores: dict[str, int] = field(default_factory=dict)
+    market_view: dict = field(default_factory=lambda: {"direction": "중립", "confidence": None, "regime": None, "invalidation": None})
+    setup_view: dict = field(default_factory=lambda: {"action_verdict": "wait_for_trigger", "entry_expectancy": "acceptable", "trigger_condition": None, "risk_reward": None})
+    account_permission: dict = field(default_factory=lambda: {"execution_permission": "manual_confirm_required", "entry_expectancy": "acceptable", "forbidden_actions": [], "reason": "decision support unavailable"})
+    final_action: str = "wait_for_trigger_with_manual_confirm"
+    decision_support: dict = field(default_factory=dict)
     model: str = ""
     elapsed_s: float = 0.0
     error: Optional[str] = None
@@ -108,6 +125,15 @@ def _parse_judge_output(text: str) -> dict:
         "bull_key": "",
         "bear_key": "",
         "rubric_scores": {},
+        "market_confidence": None,
+        "market_regime": "",
+        "invalidation": "",
+        "setup_action": "",
+        "entry_expectancy": "",
+        "execution_permission": "",
+        "account_reason": "",
+        "forbidden_actions": [],
+        "final_action": "",
     }
     reasoning_lines = []
     in_reasoning = False
@@ -129,6 +155,33 @@ def _parse_judge_output(text: str) -> dict:
             if val:
                 reasoning_lines.append(val)
             in_reasoning = True
+        elif m := re.match(r"시장\s*확신\s*[:：]\s*(\d+(?:\.\d+)?)", stripped):
+            result["market_confidence"] = float(m.group(1))
+            in_reasoning = False
+        elif m := re.match(r"시장\s*레짐\s*[:：]\s*(.+)$", stripped):
+            result["market_regime"] = m.group(1).strip()
+            in_reasoning = False
+        elif m := re.match(r"무효화\s*[:：]\s*(.+)$", stripped):
+            result["invalidation"] = m.group(1).strip()
+            in_reasoning = False
+        elif m := re.match(r"Setup\s*action\s*[:：]\s*(.+)$", stripped, re.IGNORECASE):
+            result["setup_action"] = m.group(1).strip()
+            in_reasoning = False
+        elif m := re.match(r"진입\s*기대값\s*[:：]\s*(.+)$", stripped):
+            result["entry_expectancy"] = m.group(1).strip()
+            in_reasoning = False
+        elif m := re.match(r"계좌\s*실행\s*허가\s*[:：]\s*(.+)$", stripped):
+            result["execution_permission"] = m.group(1).strip()
+            in_reasoning = False
+        elif m := re.match(r"계좌\s*제한\s*이유\s*[:：]\s*(.+)$", stripped):
+            result["account_reason"] = m.group(1).strip()
+            in_reasoning = False
+        elif m := re.match(r"금지\s*행동\s*[:：]\s*(.+)$", stripped):
+            result["forbidden_actions"] = [item.strip() for item in re.split(r"[,|]", m.group(1)) if item.strip()]
+            in_reasoning = False
+        elif m := re.match(r"Final\s*action\s*[:：]\s*(.+)$", stripped, re.IGNORECASE):
+            result["final_action"] = m.group(1).strip()
+            in_reasoning = False
         elif m := re.match(r"Bull\s*핵심\s*[:：]\s*(.+)$", stripped, re.IGNORECASE):
             result["bull_key"] = m.group(1).strip()
             in_reasoning = False
@@ -172,28 +225,16 @@ def _normalize_verdict(value: str) -> str:
     return cleaned
 
 
-def _call_llm(client: anthropic.Anthropic, system: str, user: str) -> str:
-    max_retries = 3
-    wait = 8
-    for attempt in range(max_retries):
-        try:
-            msg = client.messages.create(
-                model=JUDGE_MODEL,
-                max_tokens=JUDGE_MAX_OUTPUT_TOKENS,
-                system=system,
-                messages=[{"role": "user", "content": user}],
-            )
-            if not hasattr(msg, "content") or not isinstance(msg.content, list):
-                raise RuntimeError(
-                    f"API 응답 형식 오류 — {type(msg).__name__}: {msg!r:.200}"
-                )
-            return next((b.text for b in msg.content if b.type == "text"), "").strip()
-        except anthropic.APIStatusError as e:
-            if e.status_code in (429, 529) and attempt < max_retries - 1:
-                time.sleep(wait)
-                wait *= 2
-                continue
-            raise
+def _model_label() -> str:
+    return config.ANTHROPIC_MODEL if config.LLM_PROVIDER == "anthropic" else config.LLM_MODEL
+
+
+def _call_llm(system: str, user: str) -> str:
+    return call_text_llm(
+        system_prompt=system,
+        user_prompt=user,
+        max_tokens=JUDGE_MAX_OUTPUT_TOKENS,
+    )
 
 
 def run_judge(
@@ -204,6 +245,7 @@ def run_judge(
     agent_memories: Optional["AgentMemories"] = None,
     memory_query: str = "",
     progress_cb: Optional[ProgressCallback] = None,
+    decision_support: Optional[dict] = None,
 ) -> JudgeResult:
     """
     Bull/Bear 토론 결과를 받아 방향성을 판정한다.
@@ -225,9 +267,9 @@ def run_judge(
     """
     if not JUDGE_ENABLED:
         return JudgeResult(enabled=False, verdict="", reasoning="", bull_key="", bear_key="", raw_text="")
-    if not CLAUDE_API_KEY:
+    if not config.llm_api_key_configured():
         return JudgeResult(enabled=False, verdict="", reasoning="", bull_key="", bear_key="", raw_text="",
-                           error="CLAUDE_API_KEY 미설정")
+                           error="LLM 설정 미완료")
     if not bull_final and not bear_final:
         return JudgeResult(enabled=False, verdict="", reasoning="", bull_key="", bear_key="", raw_text="",
                            error="Bull/Bear 발언 없음 — 토론 미수행")
@@ -252,10 +294,9 @@ def run_judge(
         ),
     )
 
-    client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     t0 = time.time()
     try:
-        raw = _call_llm(client, JUDGE_SYSTEM, user_prompt)
+        raw = _call_llm(JUDGE_SYSTEM, user_prompt)
     except Exception as exc:
         return JudgeResult(
             enabled=True, verdict="중립", reasoning="", bull_key="", bear_key="",
@@ -264,6 +305,43 @@ def run_judge(
     elapsed = time.time() - t0
 
     parsed = _parse_judge_output(raw)
+    decision = decision_support if isinstance(decision_support, dict) else {}
+    execution_permission = (
+        decision.get("account_execution_permission")
+        or decision.get("execution_permission")
+        or parsed.get("execution_permission")
+        or "manual_confirm_required"
+    )
+    entry_expectancy = (
+        decision.get("setup_quality")
+        or decision.get("entry_expectancy")
+        or parsed.get("entry_expectancy")
+        or "acceptable"
+    )
+    forbidden_actions = (
+        decision.get("forbidden_action_codes")
+        or decision.get("forbidden_actions")
+        or parsed.get("forbidden_actions")
+        or []
+    )
+    execution_reasons = decision.get("execution_reasons") or []
+    account_reason = (
+        "; ".join(str(item) for item in execution_reasons)
+        or parsed.get("account_reason")
+        or "decision support unavailable"
+    )
+    market_view = {
+        "direction": parsed["verdict"] or decision.get("market_direction") or "중립",
+        "confidence": parsed.get("market_confidence"),
+        "regime": parsed.get("market_regime") or decision.get("market_regime"),
+        "invalidation": parsed.get("invalidation") or decision.get("invalidation"),
+    }
+    setup_view = {
+        "action_verdict": decision.get("setup_action_verdict") or parsed.get("setup_action") or "wait_for_trigger",
+        "entry_expectancy": entry_expectancy,
+        "trigger_condition": decision.get("trigger_condition"),
+        "risk_reward": decision.get("risk_reward"),
+    }
     return JudgeResult(
         enabled=True,
         verdict=parsed["verdict"] or "중립",
@@ -272,8 +350,18 @@ def run_judge(
         bear_key=parsed["bear_key"],
         raw_text=raw,
         rubric_scores=parsed.get("rubric_scores") or {},
-        model=JUDGE_MODEL,
+        market_view=market_view,
+        setup_view=setup_view,
+        account_permission={
+            "execution_permission": execution_permission,
+            "entry_expectancy": entry_expectancy,
+            "forbidden_actions": list(forbidden_actions),
+            "reason": account_reason,
+        },
+        final_action=decision.get("final_action") or parsed.get("final_action") or "wait_for_trigger_with_manual_confirm",
+        model=_model_label(),
         elapsed_s=round(elapsed, 2),
+        decision_support=decision,
     )
 
 
@@ -289,6 +377,14 @@ def format_judge_block(judge: Optional[JudgeResult]) -> str:
 
     lines = ["[투자 심판 결론]"]
     lines.append(f"  판정: {judge.verdict}")
+    if judge.market_view:
+        lines.append(f"  market_view: {judge.market_view}")
+    if judge.setup_view:
+        lines.append(f"  setup_view: {judge.setup_view}")
+    if judge.account_permission:
+        lines.append(f"  account_permission: {judge.account_permission}")
+    if judge.final_action:
+        lines.append(f"  final_action: {judge.final_action}")
     if judge.rubric_scores:
         score_line = ", ".join(f"{k}={v}" for k, v in judge.rubric_scores.items())
         lines.append(f"  점수: {score_line}")

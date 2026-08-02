@@ -1,5 +1,5 @@
 # =============================================
-# 내 계좌 상태 수집 (Binance Futures)
+# 내 계좌 상태 수집 (Binance Futures / Gate.io Futures)
 # 잔고 / 오픈 포지션 / 오늘 실현 손익
 # =============================================
 from __future__ import annotations
@@ -266,7 +266,7 @@ def _fetch_income_summary(symbol: Optional[str], start_ms: int) -> dict:
     return dict(summary)
 
 
-def fetch_account_context(symbol: Optional[str] = None) -> dict:
+def _fetch_binance_account_context(symbol: Optional[str] = None) -> dict:
     """
     Binance Futures API로 계좌 현황을 수집.
     개별 요청 실패 시 None으로 채워 분석 전체를 블로킹하지 않음.
@@ -481,7 +481,7 @@ def fetch_account_context(symbol: Optional[str] = None) -> dict:
     return ctx
 
 
-def format_account_context(ctx: dict) -> str:
+def _format_binance_account_context(ctx: dict) -> str:
     """현재 스냅샷 + 최근 계좌 운영 맥락을 함께 출력 — 판단은 Claude에게 위임"""
     lines = ["[계좌 / 리스크 제약]"]
 
@@ -614,3 +614,491 @@ def format_account_context(ctx: dict) -> str:
             lines.append(f"    외 {remaining}개 포지션은 노이즈 방지를 위해 생략")
 
     return "\n".join(lines)
+
+
+# =============================================
+# Gate.io provider
+# =============================================
+
+def _fetch_gate_account_context() -> dict:
+    """Gate.io Futures read-only 계좌/포지션 수집.
+
+    - key/secret 미설정 → 비활성 상태 반환 (앱 종료 없음)
+    - 조회 실패 → error 필드만 채워 반환
+    """
+    if not _cfg.gate_key_configured():
+        return {
+            "provider": "gateio",
+            "disabled": True,
+            "disabled_reason": "Gate.io API 키 또는 시크릿이 설정되지 않았습니다.",
+            "wallet": None,
+            "account": None,
+            "positions": None,
+            "wallet_error": None,
+            "account_error": None,
+            "position_error": None,
+        }
+
+    try:
+        from account_providers.gateio import fetch_gate_account_context as _gate_fetch
+        ctx = _gate_fetch(
+            base_url=_cfg.GATE_BASE_URL,
+            api_key=_cfg.GATE_API_KEY,
+            api_secret=_cfg.GATE_API_SECRET,
+            settle=_cfg.GATE_SETTLE,
+        )
+    except Exception:
+        ctx = {
+            "provider": "gateio",
+            "wallet": None,
+            "account": None,
+            "positions": None,
+            "wallet_error": "Gate.io 전체 잔고 조회 실패",
+            "account_error": "Gate.io 계좌 조회 실패",
+            "position_error": "Gate.io 포지션 조회 실패",
+        }
+
+    # ── account_equity 계산 (Gate Assets Analysis 기준) ─────────
+    # Gate /wallet/total_balance 의 total.amount 는 현재 화면상 지갑/담보 잔고에 가깝고,
+    # Assets Analysis 의 Total Assets 는 여기에 미실현 손익을 더한 값으로 보인다.
+    # 그래서 의미를 분리한다:
+    # - wallet_balance: 지갑/담보 잔고
+    # - account_equity/total_assets: 성과 차트용 총자산(지갑/담보 + 미실현)
+    # - futures_account_equity: futures accounts total/추산값
+    wallet  = ctx.get("wallet") or {}
+    account = ctx.get("account") or {}
+    positions = ctx.get("positions") or []
+
+    wallet_total_balance = None
+    try:
+        wallet_total_balance = float(wallet.get("total_amount") or 0) or None
+    except (TypeError, ValueError):
+        pass
+
+    futures_total = None
+    try:
+        futures_total = float(account.get("futures_total") or 0) or None
+    except (TypeError, ValueError):
+        pass
+
+    # futures_total이 0 또는 None이면 추산값 사용
+    # (dual/isolated 모드에서 API total=0으로 오는 경우 대응)
+    if not futures_total:
+        futures_total = None  # account_providers/gateio.py _extract_account_fields에서 이미 역산
+
+    upnl = None
+    try:
+        upnl = float(account.get("unrealised_pnl") or 0)
+    except (TypeError, ValueError):
+        pass
+
+    total_assets = None
+    if wallet_total_balance is not None:
+        total_assets = wallet_total_balance + (upnl or 0.0)
+
+    ctx["account_equity"] = total_assets if total_assets is not None else futures_total
+    ctx["total_assets"] = total_assets
+    ctx["wallet_total_balance"] = wallet_total_balance
+    ctx["futures_account_equity"] = futures_total
+
+    # open_position_count / open_position_upnl — account_history 호환 필드
+    ctx["open_position_count"] = len(positions)
+    ctx["open_position_upnl"]  = upnl
+    ctx["unrealised_pnl"]      = upnl
+
+    gross_notional = 0.0
+    long_notional = 0.0
+    short_notional = 0.0
+    weighted_actual_num = 0.0
+    weighted_actual_den = 0.0
+    for pos in positions:
+        notional = pos.get("notional")
+        if notional is None:
+            try:
+                notional = float(pos.get("size") or 0.0) * float(pos.get("mark_price") or 0.0)
+            except (TypeError, ValueError):
+                notional = None
+        try:
+            notional_f = abs(float(notional)) if notional is not None else 0.0
+        except (TypeError, ValueError):
+            notional_f = 0.0
+        if notional_f > 0:
+            gross_notional += notional_f
+            if pos.get("side") == "숏":
+                short_notional += notional_f
+            else:
+                long_notional += notional_f
+            pos["notional"] = round(notional_f, 6)
+
+        actual_lev = pos.get("actual_leverage")
+        if actual_lev is None:
+            margin_basis = pos.get("leverage_margin") or pos.get("margin") or pos.get("initial_margin")
+            try:
+                margin_basis_f = float(margin_basis)
+            except (TypeError, ValueError):
+                margin_basis_f = 0.0
+            if notional_f > 0 and margin_basis_f > 0:
+                actual_lev = notional_f / margin_basis_f
+                pos["actual_leverage"] = round(actual_lev, 4)
+                pos["leverage_margin"] = margin_basis_f
+
+        try:
+            actual_lev_f = float(actual_lev)
+        except (TypeError, ValueError):
+            actual_lev_f = 0.0
+        if notional_f > 0 and actual_lev_f > 0:
+            weighted_actual_num += actual_lev_f * notional_f
+            weighted_actual_den += notional_f
+
+    gross_actual_leverage = None
+    net_actual_leverage = None
+    net_notional = abs(long_notional - short_notional)
+    hedge_offset_ratio = None
+    if gross_notional > 0:
+        hedge_offset_ratio = 1.0 - (net_notional / gross_notional)
+    if ctx["account_equity"] and gross_notional > 0:
+        try:
+            equity_f = float(ctx["account_equity"])
+            gross_actual_leverage = gross_notional / equity_f
+            net_actual_leverage = net_notional / equity_f
+        except (TypeError, ValueError, ZeroDivisionError):
+            gross_actual_leverage = None
+            net_actual_leverage = None
+    ctx["open_position_notional"] = round(gross_notional, 6)
+    ctx["gross_position_notional"] = round(gross_notional, 6)
+    ctx["net_position_notional"] = round(net_notional, 6)
+    ctx["long_notional"] = round(long_notional, 6)
+    ctx["short_notional"] = round(short_notional, 6)
+    ctx["hedge_offset_ratio"] = round(hedge_offset_ratio, 4) if hedge_offset_ratio is not None else None
+    ctx["account_gross_leverage"] = round(gross_actual_leverage, 4) if gross_actual_leverage is not None else None
+    ctx["account_net_leverage"] = round(net_actual_leverage, 4) if net_actual_leverage is not None else None
+    ctx["account_actual_leverage"] = ctx["account_gross_leverage"]
+    ctx["position_actual_leverage"] = (
+        round(weighted_actual_num / weighted_actual_den, 4)
+        if weighted_actual_den > 0 else None
+    )
+    ctx["effective_leverage"] = ctx["account_net_leverage"]
+    ctx["leverage_display"] = (
+        f"순 {ctx['account_net_leverage']:.2f}x / 총 {ctx['account_gross_leverage']:.2f}x"
+        if ctx["account_net_leverage"] is not None and ctx["account_gross_leverage"] is not None
+        else "오픈 포지션 없음"
+    )
+
+    # wallet_balance, available_balance — account_history 호환
+    available = None
+    try:
+        available = float(account.get("available") or 0) or None
+    except (TypeError, ValueError):
+        pass
+    ctx["wallet_balance"]    = wallet_total_balance if wallet_total_balance is not None else ctx["account_equity"]
+    ctx["available_balance"] = available
+
+    open_orders = ctx.get("open_orders") if isinstance(ctx.get("open_orders"), list) else []
+    order_notional = 0.0
+    for order in open_orders:
+        try:
+            order_notional += float(order.get("notional") or 0.0)
+        except (TypeError, ValueError):
+            pass
+    order_margin = None
+    try:
+        order_margin = float(account.get("order_margin") or 0.0)
+    except (TypeError, ValueError):
+        pass
+    ctx["open_orders"] = open_orders
+    ctx["open_order_count"] = len(open_orders)
+    ctx["open_order_notional"] = round(order_notional, 6)
+    ctx["order_margin"] = order_margin
+
+    # 최근 확정손익/청산 이력: 멀티에이전트가 현재 포지션의 미실현뿐 아니라
+    # 직전 청산 성과와 청산 위치를 같이 볼 수 있게 요약한다.
+    try:
+        from account_providers.gateio import get_recent_realized_context as _gate_realized
+        ctx["realized_context"] = _gate_realized(
+            base_url=_cfg.GATE_BASE_URL,
+            api_key=_cfg.GATE_API_KEY,
+            api_secret=_cfg.GATE_API_SECRET,
+            settle=_cfg.GATE_SETTLE,
+            days=7,
+            spot_api_key=_cfg.GATE_SPOT_API_KEY,
+            spot_api_secret=_cfg.GATE_SPOT_API_SECRET,
+        )
+    except Exception:
+        ctx["realized_context"] = {
+            "status": "error",
+            "message": "최근 확정손익 조회 실패",
+            "summary": {},
+            "position_closes": [],
+        }
+
+    # account_history._apply_day_context_locked 에서 설정되지 않은 필드들 초기화
+    # → 스냅샷 저장 및 텍스트 포맷에서 KeyError / None 비교 오류 방지
+    ctx.setdefault("today_cash_pnl", None)
+    ctx.setdefault("today_realized_pnl", None)
+    ctx.setdefault("today_funding_fee", None)
+    ctx.setdefault("today_commission_fee", None)
+    ctx.setdefault("today_total_pnl", None)
+    ctx.setdefault("today_total_mode", None)
+    ctx.setdefault("today_total_label", None)
+    ctx.setdefault("day_start_equity", None)
+    ctx.setdefault("day_anchor_source", None)
+    ctx.setdefault("today_pnl_pct", None)
+    ctx.setdefault("today_eval_pnl", None)
+    ctx.setdefault("risk_status", None)
+    ctx.setdefault("carryover_positions", [])
+    ctx.setdefault("open_orders", [])
+    ctx.setdefault("open_order_count", 0)
+    ctx.setdefault("open_order_notional", 0.0)
+    ctx.setdefault("order_margin", None)
+    ctx.setdefault("order_error", None)
+
+    attach_account_context_summary(ctx)
+    return ctx
+
+
+def _format_gate_account_context(ctx: dict) -> str:
+    """Gate.io 계좌 컨텍스트를 LLM 프롬프트용 사람 읽는 형태의 텍스트로 변환.
+
+    API key, secret, sign, headers, raw request는 절대 포함하지 않는다.
+    LLM에게는 '리스크 평가 및 관점 판단'에 필요한 정보만 전달한다.
+    """
+    lines = ["[계좌 / 리스크 제약 — Gate.io Futures (read-only)]"]
+
+    if ctx.get("disabled"):
+        lines.append(f"  계좌 연동 비활성 — {ctx.get('disabled_reason', '설정 누락')}")
+        return "\n".join(lines)
+
+    wallet  = ctx.get("wallet") or {}
+    acc     = ctx.get("account") or {}
+    acc_err = ctx.get("account_error")
+    settle  = (acc.get("currency") or _cfg.GATE_SETTLE.upper())
+
+    # ── 잔고 (라벨 분리) ──────────────────────
+    if ctx.get("wallet_error") and ctx.get("account_error"):
+        lines.append(f"  잔고 조회 실패 — {acc_err or ctx.get('wallet_error')}")
+    else:
+        # 전체 계정 총자산 (Gate Assets Analysis 기준)
+        total_assets = ctx.get("total_assets")
+        if total_assets is None and wallet.get("total_amount") is not None:
+            try:
+                total_assets = float(wallet.get("total_amount")) + float(acc.get("unrealised_pnl") or 0.0)
+            except (TypeError, ValueError):
+                total_assets = wallet.get("total_amount")
+        if total_assets is not None:
+            lines.append(f"  전체 계정 총자산:      {float(total_assets):,.2f} {settle}")
+
+        wallet_total = ctx.get("wallet_total_balance")
+        if wallet_total is None:
+            wallet_total = wallet.get("total_amount")
+        if wallet_total is not None:
+            lines.append(f"  지갑/담보 잔고:       {float(wallet_total):,.2f} {settle}")
+
+        # 선물 계정 가치
+        fut_total  = acc.get("futures_total")
+        fut_source = acc.get("futures_total_source", "estimated")
+        if fut_total is not None:
+            label = "선물 계정 가치" if fut_source == "api" else "선물 계정 가치(추산)"
+            lines.append(f"  {label}:    {float(fut_total):,.2f} {settle}")
+
+        # 사용 가능 여유 증거금
+        available = acc.get("available")
+        if available is not None:
+            lines.append(f"  사용 가능 여유 증거금: {float(available):,.2f} {settle}")
+
+        # 포지션 증거금
+        iso_margin = acc.get("isolated_position_margin")
+        if iso_margin is not None:
+            lines.append(f"  포지션 증거금(격리):   {float(iso_margin):,.2f} {settle}")
+
+        # 주문/동결 증거금
+        order_margin = ctx.get("order_margin")
+        if order_margin is None:
+            order_margin = acc.get("order_margin")
+        if order_margin is not None and float(order_margin) > 0:
+            lines.append(f"  주문 동결 증거금:      {float(order_margin):,.2f} {settle}")
+
+        order_count = ctx.get("open_order_count")
+        order_notional = ctx.get("open_order_notional")
+        if order_count is not None:
+            if int(order_count or 0) > 0:
+                lines.append(
+                    f"  미체결 주문:           {int(order_count)}개 / 명목 ${float(order_notional or 0):,.2f}"
+                )
+            else:
+                lines.append("  미체결 주문:           없음")
+
+        # 미실현 손익
+        upnl = acc.get("unrealised_pnl")
+        if upnl is not None:
+            lines.append(f"  미실현 손익:           {float(upnl):+,.2f} {settle}")
+
+        gross_lev = ctx.get("account_gross_leverage")
+        net_lev = ctx.get("account_net_leverage")
+        hedge_ratio = ctx.get("hedge_offset_ratio")
+        if gross_lev is not None and net_lev is not None:
+            hedge_text = (
+                f", 헤지 상쇄 {float(hedge_ratio) * 100:.1f}%"
+                if hedge_ratio is not None else ""
+            )
+            lines.append(
+                f"  계좌 실배율:           순노출 {float(net_lev):.2f}x / "
+                f"총노출 {float(gross_lev):.2f}x{hedge_text}"
+            )
+            lines.append(
+                f"    - 총노출은 수수료/청산거리 부담, 순노출은 롱숏 상쇄 후 방향성 위험 기준"
+            )
+
+    order_err = ctx.get("order_error")
+    if order_err:
+        lines.append(f"  미체결 주문 조회 실패 — {order_err}")
+
+    # ── 포지션 ────────────────────────────────
+    positions = ctx.get("positions")
+    pos_err   = ctx.get("position_error")
+
+    if positions is None:
+        lines.append(f"  포지션 조회 실패 — {pos_err or '알 수 없는 오류'}")
+    elif not positions:
+        lines.append("  현재 오픈 포지션: 없음")
+    else:
+        lines.append(f"  오픈 포지션: {len(positions)}개")
+        for p in positions[:4]:
+            entry          = p.get("entry_price")
+            mark           = p.get("mark_price")
+            liq            = p.get("liq_price")
+            upnl           = p.get("unrealised_pnl")
+            lev            = p.get("leverage")
+            size_qty       = p.get("size")
+            size_contracts = p.get("size_contracts")
+            cs             = p.get("contract_size")
+            margin_mode    = p.get("margin_mode", "")
+            side           = p.get("side", "")
+            actual_lev     = p.get("actual_leverage")
+            lev_margin     = p.get("leverage_margin")
+            lev_basis      = p.get("actual_leverage_basis")
+            notional       = p.get("notional")
+
+            # 사람 읽는 형태: "isolated long 3x, 0.0173 BTC (173계약)"
+            actual_str = f"실배율 {float(actual_lev):.2f}x" if actual_lev is not None else "실배율 N/A"
+            mode_str = (
+                f"{margin_mode} {side.lower()} 설정 {lev}x / {actual_str}"
+                if margin_mode and lev else f"{side} 설정 {lev}x / {actual_str}"
+            )
+            if cs is not None and size_contracts is not None:
+                size_str = f"{size_qty} BTC ({size_contracts}계약)"
+            else:
+                size_str = str(size_qty)
+
+            entry_str = f"진입 ${float(entry):,.2f}" if entry else ""
+            mark_str  = f"현재 ${float(mark):,.2f}"  if mark  else ""
+            liq_str   = f"청산가 ${float(liq):,.2f}" if liq   else ""
+            upnl_str  = f"미실현 ${float(upnl):+,.2f}" if upnl is not None else ""
+            notional_str = f"명목 ${float(notional):,.2f}" if notional is not None else ""
+            if lev_basis == "isolated_margin":
+                margin_label = "격리마진(추가증거금 반영)"
+            elif lev_basis == "position_margin":
+                margin_label = "포지션마진"
+            elif lev_basis == "initial_margin":
+                margin_label = "초기마진"
+            else:
+                margin_label = "기준마진"
+            margin_str = f"{margin_label} ${float(lev_margin):,.2f}" if lev_margin is not None else ""
+            detail = "  ".join(filter(None, [entry_str, mark_str, liq_str, upnl_str, notional_str, margin_str]))
+            lines.append(
+                f"    [{p['contract']} {mode_str}]  {size_str}  {detail}"
+            )
+        if len(positions) > 4:
+            lines.append(f"    외 {len(positions) - 4}개 포지션 생략")
+
+    realized_ctx = ctx.get("realized_context") or {}
+    realized_summary = realized_ctx.get("summary") or {}
+    recent_closes = realized_ctx.get("position_closes") or []
+    if realized_summary:
+        net = realized_summary.get("net_trading_pnl")
+        pnl = realized_summary.get("realized_pnl")
+        fees = realized_summary.get("fees")
+        self_rebate = realized_summary.get("self_rebate")
+        net_fees = realized_summary.get("net_fees")
+        funding = realized_summary.get("funding")
+        try:
+            lines.append(
+                "  최근 7일 확정손익: "
+                f"순손익 {float(net):+,.2f} {settle} "
+                f"(실현 {float(pnl):+,.2f}, 수수료 {float(fees):+,.2f}, "
+                f"페이백 {float(self_rebate):+,.2f}, 실질수수료 {float(net_fees):+,.2f}, "
+                f"펀딩 {float(funding):+,.2f})"
+            )
+            if realized_ctx.get("needs_spot_permission"):
+                lines.append("  ※ 페이백 조회 권한/응답 문제로 최근 확정손익의 self_rebate가 누락됐을 수 있음")
+        except (TypeError, ValueError):
+            pass
+    if recent_closes:
+        lines.append("  최근 청산 이력:")
+        for close in recent_closes[:5]:
+            contract = close.get("contract") or "N/A"
+            side = close.get("side") or "?"
+            pnl = close.get("pnl")
+            close_price = close.get("close_price")
+            entry_price = close.get("entry_price")
+            time_label = close.get("time_label") or ""
+            parts = [f"{time_label} {contract} {side}"]
+            try:
+                parts.append(f"확정손익 {float(pnl):+,.2f} {settle}")
+            except (TypeError, ValueError):
+                pass
+            if entry_price is not None:
+                try:
+                    parts.append(f"진입 ${float(entry_price):,.2f}")
+                except (TypeError, ValueError):
+                    pass
+            if close_price is not None:
+                try:
+                    parts.append(f"청산 ${float(close_price):,.2f}")
+                except (TypeError, ValueError):
+                    pass
+            lines.append("    - " + " / ".join(parts))
+
+    return "\n".join(lines)
+
+
+# =============================================
+# 공통 진입점 (provider 분기)
+# =============================================
+
+def fetch_account_context(symbol: Optional[str] = None) -> dict:
+    """ACCOUNT_PROVIDER 설정에 따라 Binance 또는 Gate.io 계좌 컨텍스트를 반환.
+
+    - ACCOUNT_FEATURES_ENABLED=0 또는 ACCOUNT_PROVIDER=none → 빈 컨텍스트
+    - ACCOUNT_PROVIDER=gateio → Gate.io read-only 조회
+    - 그 외 → Binance (기존 동작)
+    """
+    if not _cfg.ACCOUNT_FEATURES_ENABLED:
+        return {"provider": "disabled", "disabled": True}
+
+    provider = _cfg.ACCOUNT_PROVIDER
+    if provider == "none":
+        return {"provider": "none", "disabled": True}
+    if provider == "gateio":
+        return _fetch_gate_account_context()
+    # 기본: binance
+    return _fetch_binance_account_context(symbol)
+
+
+def format_account_context(ctx: dict) -> str:
+    """계좌 컨텍스트 dict를 LLM 프롬프트용 텍스트로 변환.
+
+    API key, secret, sign, headers는 절대 포함하지 않는다.
+    """
+    if ctx.get("disabled"):
+        reason = ctx.get("disabled_reason", "")
+        if reason:
+            return f"[계좌 / 리스크 제약]\n  계좌 연동 비활성 — {reason}"
+        provider = ctx.get("provider", "")
+        if provider == "none":
+            return "[계좌 / 리스크 제약]\n  계좌 연동 비활성 (ACCOUNT_PROVIDER=none)"
+        return "[계좌 / 리스크 제약]\n  계좌 연동 비활성"
+
+    provider = ctx.get("provider", "")
+    if provider == "gateio":
+        return _format_gate_account_context(ctx)
+    return _format_binance_account_context(ctx)

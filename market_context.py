@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from config import BINANCE_FUTURES_URL, BINANCE_API_KEY, BINANCE_SECRET_KEY, DEFAULT_SYMBOL
 from time_utils import format_kst
 from http_client import _session as _http  # 프록시 환경변수 무시 세션
+from decision_support import SOURCE_LABELS, freshness, oi_changes, taker_delta_features
 
 
 def _signed_get(url: str, params: dict) -> requests.Response:
@@ -121,9 +122,10 @@ def _fetch_binance(symbol: str, ctx: dict) -> None:
         r.raise_for_status()
         hist = r.json()
         if len(hist) >= 2:
-            oi_now = float(hist[-1]["sumOpenInterest"])
-            oi_24h = float(hist[0]["sumOpenInterest"])
-            ctx["oi_change_24h_pct"] = (oi_now - oi_24h) / oi_24h * 100 if oi_24h else None
+            changes = oi_changes([item.get("sumOpenInterest") for item in hist])
+            for horizon, value in changes.items():
+                ctx[f"binance_oi_change_{horizon}_pct"] = value
+            ctx["oi_change_24h_pct"] = changes["24h"]  # legacy compatibility
         else:
             ctx["oi_change_24h_pct"] = None
     except Exception:
@@ -162,6 +164,7 @@ def _fetch_binance(symbol: str, ctx: dict) -> None:
             ctx["cvd_4h"]      = sum(                 # 최근 4h 델타 (단기 모멘텀)
                 h["buy"] - h["sell"] for h in taker_hist[-4:]
             )
+            ctx.update(taker_delta_features(taker_hist))
         else:
             ctx["taker_history"] = ctx["cvd_series"] = ctx["cvd_current"] = ctx["cvd_4h"] = None
     except Exception:
@@ -353,7 +356,7 @@ def _fetch_bybit_oi(ctx: dict, symbol: str = "BTCUSDT") -> None:
                 "category":     "linear",
                 "symbol":       symbol,
                 "intervalTime": "1h",
-                "limit":        1,
+                "limit":        25,
             },
             timeout=6,
         )
@@ -365,6 +368,9 @@ def _fetch_bybit_oi(ctx: dict, symbol: str = "BTCUSDT") -> None:
             return
 
         bybit_oi_btc = float(items[0]["openInterest"])
+
+        for horizon, value in oi_changes([item.get("openInterest") for item in reversed(items)]).items():
+            ctx[f"bybit_oi_change_{horizon}_pct"] = value
 
         ctx["bybit_oi"] = round(bybit_oi_btc, 1)
 
@@ -439,6 +445,18 @@ def fetch_market_context(symbol: str = DEFAULT_SYMBOL) -> dict:
 
     btc_price = ctx.get("mark_price") or ctx.get("index_price") or 80000.0
     _fetch_deribit(btc_price, ctx)
+
+    ctx.update(SOURCE_LABELS)
+    ctx["freshness"] = {
+        "price": freshness(ctx.get("mark_price"), "price"),
+        "bybit_oi": freshness(ctx.get("bybit_oi"), "derivatives"),
+        "funding": freshness(ctx.get("funding_rate"), "derivatives"),
+        "taker_delta": freshness(ctx.get("taker_delta_4h"), "derivatives"),
+    }
+    for horizon in ("1h", "4h", "24h"):
+        values = [ctx.get(f"{venue}_oi_change_{horizon}_pct") for venue in ("binance", "bybit")]
+        values = [value for value in values if value is not None]
+        ctx[f"aggregated_oi_change_{horizon}_pct"] = sum(values) / len(values) if values else None
 
     return ctx
 

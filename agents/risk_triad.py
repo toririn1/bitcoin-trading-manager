@@ -5,7 +5,7 @@
 # 적용:
 #   - Bull/Bear 토론 결과 + 공통 데이터를 입력으로
 #   - 3자(공격/보수/중립)가 리스크 관점에서 추가 토론
-#   - 결과는 최종 analyze_with_claude() 의 [사전 토론] 블록에 추가 주입
+#   - 결과는 최종 analyze_with_llm() 의 [사전 토론] 블록에 추가 주입
 # =============================================
 from __future__ import annotations
 
@@ -14,9 +14,8 @@ import time
 from dataclasses import dataclass, field, asdict
 from typing import Callable, Optional
 
-import anthropic
-
-from config import CLAUDE_API_KEY
+import config
+from llm_client import call_text_llm
 from .risk_prompts import (
     AGGRESSIVE_SYSTEM,
     CONSERVATIVE_SYSTEM,
@@ -78,6 +77,11 @@ class RiskTriadResult:
     final_conservative: str = ""
     final_neutral: str = ""
     error: Optional[str] = None
+    decision_support: dict = field(default_factory=dict)
+    market_view: dict = field(default_factory=lambda: {"direction": "중립", "regime": None, "invalidation": None})
+    setup_view: dict = field(default_factory=lambda: {"action_verdict": "wait_for_trigger", "entry_expectancy": "acceptable", "trigger_condition": None, "risk_reward": None})
+    account_permission: dict = field(default_factory=lambda: {"execution_permission": "manual_confirm_required", "entry_expectancy": "acceptable", "forbidden_actions": [], "reason": "decision support unavailable"})
+    final_action: str = "wait_for_trigger_with_manual_confirm"
 
     def to_payload(self) -> dict:
         return {
@@ -88,36 +92,27 @@ class RiskTriadResult:
             "final_conservative": self.final_conservative,
             "final_neutral": self.final_neutral,
             "error": self.error,
+            "decision_support": self.decision_support,
+            "market_view": self.market_view,
+            "setup_view": self.setup_view,
+            "account_permission": self.account_permission,
+            "final_action": self.final_action,
         }
 
 
 ProgressCallback = Callable[[str, str], None]
 
 
-def _call_llm(client: anthropic.Anthropic, system: str, user: str) -> str:
-    """Risk 에이전트 단일 호출. 429/529 백오프 포함."""
-    max_retries = 3
-    wait = 8
-    for attempt in range(max_retries):
-        try:
-            msg = client.messages.create(
-                model=RISK_MODEL,
-                max_tokens=RISK_MAX_OUTPUT_TOKENS,
-                system=system,
-                messages=[{"role": "user", "content": user}],
-            )
-            if not hasattr(msg, "content") or not isinstance(msg.content, list):
-                raise RuntimeError(
-                    f"API 응답 형식 오류 — {type(msg).__name__}: {msg!r:.200}"
-                )
-            text = next((b.text for b in msg.content if b.type == "text"), "")
-            return text.strip()
-        except anthropic.APIStatusError as e:
-            if e.status_code in (429, 529) and attempt < max_retries - 1:
-                time.sleep(wait)
-                wait *= 2
-                continue
-            raise
+def _model_label() -> str:
+    return config.ANTHROPIC_MODEL if config.LLM_PROVIDER == "anthropic" else config.LLM_MODEL
+
+
+def _call_llm(system: str, user: str) -> str:
+    return call_text_llm(
+        system_prompt=system,
+        user_prompt=user,
+        max_tokens=RISK_MAX_OUTPUT_TOKENS,
+    )
 
 
 def run_risk_triad(
@@ -130,6 +125,7 @@ def run_risk_triad(
     agent_memories: Optional["AgentMemories"] = None,
     memory_query: str = "",
     judge_block: str = "",
+    decision_support: Optional[dict] = None,
 ) -> RiskTriadResult:
     """
     Aggressive/Conservative/Neutral 3자 토론을 실행한다.
@@ -161,13 +157,32 @@ def run_risk_triad(
 
     if not RISK_ENABLED:
         return RiskTriadResult(enabled=False, rounds=0)
-    if not CLAUDE_API_KEY:
-        return RiskTriadResult(enabled=False, rounds=0, error="CLAUDE_API_KEY 미설정")
+    if not config.llm_api_key_configured():
+        return RiskTriadResult(enabled=False, rounds=0, error="LLM 설정 미완료")
 
-    client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     result = RiskTriadResult(enabled=True, rounds=rounds)
 
     _query = memory_query or context_blob[:200]
+    decision = decision_support if isinstance(decision_support, dict) else {}
+    result.decision_support = decision
+    result.market_view = {
+        "direction": decision.get("market_direction", "중립"),
+        "regime": decision.get("market_regime"),
+        "invalidation": decision.get("invalidation"),
+    }
+    result.setup_view = {
+        "action_verdict": decision.get("setup_action_verdict", "wait_for_trigger"),
+        "entry_expectancy": decision.get("setup_quality") or decision.get("entry_expectancy", "acceptable"),
+        "trigger_condition": decision.get("trigger_condition"),
+        "risk_reward": decision.get("risk_reward"),
+    }
+    result.account_permission = {
+        "execution_permission": decision.get("account_execution_permission") or decision.get("execution_permission", "manual_confirm_required"),
+        "entry_expectancy": decision.get("setup_quality") or decision.get("entry_expectancy", "acceptable"),
+        "forbidden_actions": list(decision.get("forbidden_action_codes") or decision.get("forbidden_actions") or []),
+        "reason": "; ".join(str(item) for item in (decision.get("execution_reasons") or [])) or "decision support unavailable",
+    }
+    result.final_action = decision.get("final_action", "wait_for_trigger_with_manual_confirm")
     last = {"aggressive": "", "conservative": "", "neutral": ""}
 
     try:
@@ -220,14 +235,14 @@ def run_risk_triad(
                 )
 
                 t0 = time.time()
-                reply = _call_llm(client, system_prompt, user_prompt)
+                reply = _call_llm(system_prompt, user_prompt)
                 elapsed = time.time() - t0
 
                 result.turns.append(RiskTurn(
                     side=side,
                     round_index=r,
                     content=reply,
-                    model=RISK_MODEL,
+                    model=_model_label(),
                     elapsed_s=round(elapsed, 2),
                 ))
                 last[side] = reply

@@ -16,6 +16,7 @@ _REQUIRED_TF_COLUMNS = (
 _MACRO_KEYS = ("TNX_10Y", "FVX_5Y", "DXY", "STABLE_MCAP", "USDT_DOM", "BTC_DOM", "HYG_LQD", "IBIT_PX")
 _MARKET_KEYS = ("funding_rate", "open_interest", "combined_oi", "cvd_4h", "ob_imbalance")
 _ACCOUNT_KEYS = ("wallet_balance", "account_equity", "open_position_count", "today_cash_pnl")
+_GATE_ACCOUNT_KEYS = ("total_assets", "account_equity", "open_position_count", "today_total_pnl")
 
 
 def _as_float(value: Any) -> float | None:
@@ -257,9 +258,14 @@ def build_data_quality_report(
             trusted.append(f"{key} 시장심리 사용 가능")
 
     account = account_ctx or {}
-    for key in _ACCOUNT_KEYS:
+    account_keys = _GATE_ACCOUNT_KEYS if account.get("provider") == "gateio" else _ACCOUNT_KEYS
+    for key in account_keys:
         if account.get(key) is None:
             cautions.append(f"{key} 계좌 정보 없음")
+    if account.get("provider") == "gateio":
+        realized_summary = (account.get("realized_context") or {}).get("summary") or {}
+        if realized_summary.get("net_trading_pnl") is None:
+            cautions.append("realized_context.summary.net_trading_pnl 계좌 정보 없음")
 
     quality_score = 100
     quality_score -= min(45, len(no_use) * 5)

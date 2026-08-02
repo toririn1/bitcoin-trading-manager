@@ -1,18 +1,19 @@
 # =============================================
-# Claude API 연동 - 매매 시그널 분석
+# LLM API 연동 - 매매 시그널 분석
 # =============================================
 import re
 import time
 import json
-import anthropic
 from typing import Any, Optional
-from config import CLAUDE_API_KEY, CLAUDE_MODEL, DEFAULT_SYMBOL, symbol_to_pair
+from config import DEFAULT_SYMBOL, symbol_to_pair
 from indicators import summarize_indicators, fibonacci_swing_levels, fib_window_for_tf
 from account_context import fetch_account_context, format_account_context
 from market_context import fetch_market_context, format_market_context
+from decision_bridge import build_decision_support, format_decision_context, apply_trade_quality
 from macro_fetcher import fetch_macro_context, format_macro_context
 from analysis_context import build_analysis_context
 from time_utils import now_kst
+from llm_client import call_analysis_llm
 from agents import (
     run_bull_bear_debate,
     format_debate_block,
@@ -56,7 +57,11 @@ import logging as _logging
 _memory_logger = _logging.getLogger(__name__)
 # 메모리 쓰기 전역 스위치 — 스테이징/백테스트 환경에서 기록 방지용
 MEMORY_WRITE_ENABLED = _os.getenv("MEMORY_WRITE_ENABLED", "1").lower() not in ("0", "false", "no")
-PROMPT_CACHE_ENABLED = _os.getenv("CLAUDE_PROMPT_CACHE_ENABLED", "1").lower() not in ("0", "false", "no")
+_LEGACY_PROMPT_CACHE_ENV = "CLAUDE" + "_PROMPT_CACHE_ENABLED"
+PROMPT_CACHE_ENABLED = _os.getenv(
+    "LLM_PROMPT_CACHE_ENABLED",
+    _os.getenv(_LEGACY_PROMPT_CACHE_ENV, "1"),
+).lower() not in ("0", "false", "no")
 
 PAIR_LABEL = symbol_to_pair(DEFAULT_SYMBOL)
 
@@ -273,12 +278,22 @@ USER_PROMPT_TEMPLATE = """<analysis_request>
 
 💬 한줄 요약: [전체를 한 문장으로]
 
+🧩 최종 Decision Support
+1. 시장 방향: [account 상태와 무관한 market_direction과 확신도]
+2. 방향 근거: [OI 1h/4h/24h, taker delta divergence, source/freshness, Gate fee/rebate]
+3. 반대 시나리오: [핵심 반대 시나리오]
+4. 무효화 조건: [15m/1h 기준]
+5. 진입 기대값: [setup_action_verdict, entry_expectancy, R:R, trigger_condition]
+6. 계좌 실행 허가: [account_execution_permission, 기존 포지션 관리, final_action]
+7. 금지 행동: [forbidden_actions]
+
 중요:
 - [시장 레짐]은 반드시 위 6개 중 정확히 1개만 쓰고, 괄호 설명이나 복수 선택을 하지 마세요.
 - [관심 레벨]의 4개 항목과 [매매 파라미터]의 4개 항목은 각 줄마다 숫자 또는 N/A만 적으세요. 이유·조건·괄호 설명 금지.
 - 2차 저항/지지 같은 추가 항목을 만들지 마세요.
 - [권장 레버리지]는 반드시 정수(예: 3배, 5배)로만 적고 범위·슬래시 표기 금지.
 </report_contract>
+<decision_report_contract>최종 리포트는 아래 7개 번호 섹션을 이 순서 그대로 반드시 포함하세요: 1. 시장 방향 — account 상태와 무관한 market_direction과 확신도. 2. 방향 근거 — 가격 구조, OI 1h/4h/24h, taker delta divergence, source_labels/freshness_warnings, Gate gross/net/conservative fee·rebate 요약. 3. 반대 시나리오. 4. 무효화 조건 — 15m와 1h. 5. 진입 기대값 — setup_action_verdict, entry_expectancy, 현재가 R:R, trigger_price/trigger_condition, 추격 위험. 조건부 문장이 있거나 현재가가 entry_zone 밖이면 wait_for_trigger이며 good을 쓰지 마세요. 6. 계좌 실행 허가 — account_execution_permission, 이유, 기존 포지션 관리, setup과 account를 합성한 final_action. 7. 금지 행동 — forbidden_actions. 시장 방향·setup·계좌 오버레이·final_action을 절대 혼동하지 마세요. blocked/hard_block은 계좌 기준 신규 실행만 제한하며 시장 방향이나 setup을 중립/no_trade로 덮어쓰지 않습니다. reduce_size_only/manual_confirm_required에는 '신규 진입 금지'를 쓰지 말고 사이즈·배율·재진입 제한을 구체화하세요. 단언적 판정 스타일을 유지하고 금융 조언 회피성 표현으로 흐리지 마세요.</decision_report_contract>
 </analysis_request>
 """
 
@@ -451,8 +466,11 @@ def _build_context_blob(
         f"1h 기준: {fib_1h}\n"
         f"4h 기준: {fib_4h}"
     )
+    decision_support = build_decision_support(market_ctx, account_ctx)
+    context_blob += format_decision_context(decision_support)
     if return_raw:
         return context_blob, {
+            "decision_support": decision_support,
             "macro": macro_payload,
             "market": market_ctx,
             "account": account_ctx,
@@ -467,9 +485,10 @@ def build_prompt(
     debate_block: str = "",
     delta_block: str = "",
     lessons_block: str = "",
+    context_blob: str | None = None,
 ) -> str:
     """
-    최종 애널리스트 Claude 호출용 user prompt 를 조립한다.
+    최종 애널리스트 LLM 호출용 user prompt 를 조립한다.
 
     Parameters
     ----------
@@ -484,7 +503,7 @@ def build_prompt(
     lessons_block : str, optional
         agents.memory.format_lessons_block() 의 출력 — 과거 reflection 체크리스트.
     """
-    context_blob = _build_context_blob(multi_tf_data, macro_snapshot)
+    context_blob = context_blob or _build_context_blob(multi_tf_data, macro_snapshot)
     now_kst_label = now_kst().strftime("%Y-%m-%d %H:%M")
 
     def _sep(block: str) -> str:
@@ -709,7 +728,7 @@ def parse_signal(text: str) -> tuple[str, int]:
 
 def parse_leverage(text: str) -> Optional[int]:
     """
-    Claude 분석 텍스트에서 권장 레버리지를 파싱.
+    LLM 분석 텍스트에서 권장 레버리지를 파싱.
     '권장 레버리지' 필드 우선, 없으면 자유 텍스트에서 탐색.
     반환: 1~10 범위 정수 or None
     """
@@ -859,7 +878,7 @@ def _strip_analysis_json_block(text: str) -> str:
 
 
 def _extract_analysis_json(text: str) -> dict:
-    """Claude 응답의 <analysis_json> 블록을 dict로 파싱. 실패하면 빈 dict."""
+    """LLM 응답의 <analysis_json> 블록을 dict로 파싱. 실패하면 빈 dict."""
     if not text:
         return {}
     m = re.search(
@@ -1127,24 +1146,59 @@ def _render_report_from_structured(analysis_json: dict) -> str:
         f"💬 한줄 요약: {summary}",
     ])
     return "\n".join(lines)
+DECISION_REPORT_MARKER = "🧩 최종 Decision Support"
 
 
-def _system_prompt_param():
-    """Anthropic prompt caching: 정적 system prompt를 cache breakpoint로 표시."""
-    if not PROMPT_CACHE_ENABLED:
-        return SYSTEM_PROMPT
-    return [
-        {
-            "type": "text",
-            "text": SYSTEM_PROMPT,
-            "cache_control": {"type": "ephemeral"},
-        }
+def append_decision_report_sections(
+    report_text: str,
+    decision: dict,
+    analysis_json: Optional[dict] = None,
+) -> str:
+    """Append one authoritative seven-section decision block to the legacy report."""
+    base = str(report_text or "").split(DECISION_REPORT_MARKER, 1)[0].rstrip()
+    analysis_json = analysis_json if isinstance(analysis_json, dict) else {}
+    fee = decision.get("fee_summary") if isinstance(decision.get("fee_summary"), dict) else {}
+    counter = analysis_json.get("counter_scenario") or []
+    if isinstance(counter, list):
+        counter_text = " / ".join(str(item) for item in counter if item) or "데이터 없음"
+    else:
+        counter_text = str(counter or "데이터 없음")
+    basis = (
+        f"OI={decision.get('oi_changes')}; "
+        f"taker_delta_divergence={decision.get('taker_delta_divergence')}; "
+        f"sources={decision.get('source_labels')}; "
+        f"freshness={decision.get('freshness_warnings')}; "
+        f"gross/net/conservative_fee="
+        f"{fee.get('gross_fee')}/{fee.get('net_fee')}/{fee.get('conservative_net_fee')}"
+    )
+    setup = (
+        f"{decision.get('setup_action_verdict')} / {decision.get('setup_quality')}; "
+        f"R:R={decision.get('risk_reward')}; "
+        f"trigger={decision.get('trigger_condition') or decision.get('raw_trigger_text') or '없음'}"
+    )
+    account = (
+        f"{decision.get('account_execution_permission')}; "
+        f"reasons={decision.get('execution_reasons') or []}; "
+        f"position={decision.get('existing_position_guidance') or '없음'}; "
+        f"final_action={decision.get('final_action')}"
+    )
+    forbidden = decision.get("forbidden_action_labels") or decision.get("forbidden_actions") or []
+    block = [
+        DECISION_REPORT_MARKER,
+        f"1. 시장 방향: {decision.get('market_direction', '중립')}",
+        f"2. 방향 근거: {basis}",
+        f"3. 반대 시나리오: {counter_text}",
+        f"4. 무효화 조건: {decision.get('invalidation') or '데이터 없음'}",
+        f"5. 진입 기대값: {setup}",
+        f"6. 계좌 실행 허가: {account}",
+        f"7. 금지 행동: {', '.join(str(item) for item in forbidden) or '없음'}",
     ]
+    return f"{base}\n\n" + "\n".join(block)
 
 
 def _analysis_tool_schema() -> dict:
     """
-    ANALYST_USE_TOOL_SCHEMA=1 일 때 Claude 에 전달할 tool 정의.
+    Anthropic tool_use 또는 OpenAI json_schema 에 사용하는 구조화 분석 정의.
     스키마 강제로 JSON parse 실패가 구조적으로 사라진다.
     """
     return {
@@ -1234,16 +1288,18 @@ def _analysis_tool_schema() -> dict:
     }
 
 
-def analyze_with_claude(
+def analyze_with_llm(
     multi_tf_data: dict,
     macro_snapshot: Optional[dict] = None,
     debate: Optional[DebateResult] = None,
     pipeline: Optional[PipelineResult] = None,
     delta_block: str = "",
     lessons_block: str = "",
+    context_blob: str | None = None,
+    raw_context: Optional[dict] = None,
 ) -> dict:
     """
-    최종 애널리스트 Claude 호출.
+    최종 애널리스트 LLM 호출.
 
     토론/리스크/메모리 컨텍스트 주입 우선순위:
       1) pipeline (Phase 2+3 통합 블록, combined_block)
@@ -1252,8 +1308,6 @@ def analyze_with_claude(
 
     delta_block / lessons_block 은 run_full_analysis 가 만들어 전달.
     """
-    client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-
     if pipeline is not None and pipeline.combined_block:
         debate_block = pipeline.combined_block
     elif debate is not None:
@@ -1261,80 +1315,30 @@ def analyze_with_claude(
     else:
         debate_block = ""
 
+    if context_blob is not None and isinstance(raw_context, dict):
+        shared_context_blob, shared_context_raw = context_blob, raw_context
+    else:
+        shared_context_blob, shared_context_raw = _build_context_blob(
+            multi_tf_data, macro_snapshot, return_raw=True
+        )
     prompt = build_prompt(
         multi_tf_data,
         macro_snapshot=macro_snapshot,
         debate_block=debate_block,
         delta_block=delta_block,
         lessons_block=lessons_block,
+        context_blob=shared_context_blob,
     )
-    # 실제 출력 구조: tool_use JSON + 한국어 리포트 10개 섹션 ≈ 1500~3000 tokens.
-    # 기본값 8000: 구조화 출력과 본문을 함께 받을 때 마지막 섹션 잘림을 피하는 여유.
-    # (5000 → 8000 으로 상향 — 본문이 길어지는 변동성 국면에서 마지막 섹션이 잘리는 사례 관측)
-    _analyst_max_tokens = int(_os.getenv("ANALYST_MAX_TOKENS", "8000"))
-    request_kwargs = {
-        "model": CLAUDE_MODEL,
-        "max_tokens": _analyst_max_tokens,
-        "system": _system_prompt_param(),
-        "messages": [{"role": "user", "content": prompt}],
-    }
-
-    # ── Tool Use opt-in (ANALYST_USE_TOOL_SCHEMA=1) ──
-    # JSON 스키마를 tool 로 강제하면 regex parse 실패가 구조적으로 사라짐.
-    # 본문 한국어 리포트는 동일 응답의 text 블록에서 함께 받음.
-    _use_tool = _os.getenv("ANALYST_USE_TOOL_SCHEMA", "1").lower() not in ("0", "false", "no", "")
-    if _use_tool:
-        request_kwargs["tools"] = [_analysis_tool_schema()]
-        # tool_choice 강제하지 않음. 모델이 본문을 생략하는 경우는
-        # 아래에서 tool_json 기반 표준 리포트로 결정적으로 복원한다.
-
-    # thinking 완전 비활성화 — 최종 분석은 이미 debate/judge/risk 블록이 reasoning을 제공하므로
-    # adaptive thinking은 수만 토큰을 소모해 비용을 크게 높임. 구조화 출력에는 불필요.
-
-    # 529/429 과부하 대비 지수 백오프 재시도 (최대 4회: 10s → 20s → 40s → 80s)
-    max_retries = 4
-    wait = 10
-    message = None
-    for attempt in range(max_retries):
-        try:
-            message = client.messages.create(**request_kwargs)
-            break
-
-        except anthropic.APIStatusError as e:
-            if e.status_code == 400 and request_kwargs.get("system") != SYSTEM_PROMPT:
-                # 모델/SDK 조합이 cache_control system block을 받지 못하면
-                # 동일 프롬프트를 일반 system 문자열로 한 번 더 시도한다.
-                request_kwargs["system"] = SYSTEM_PROMPT
-                continue
-            if e.status_code in (429, 529) and attempt < max_retries - 1:
-                time.sleep(wait)
-                wait *= 2  # 10 → 20 → 40 → 80초
-            else:
-                raise
-
-    # 응답 타입 방어 검사 — SDK 버전이나 API 오류로 인해 예상 외 타입이 반환될 수 있음
-    if message is None:
-        raise RuntimeError("Anthropic API 응답 없음 (모든 재시도 소진)")
-    if not hasattr(message, "content") or not isinstance(message.content, list):
-        raise RuntimeError(
-            f"Anthropic API 응답 형식 오류 — 타입: {type(message).__name__}, "
-            f"content: {getattr(message, 'content', '(없음)')!r:.200}"
-        )
-
-    # 응답 블록에서 텍스트와 tool_use 추출 (thinking 블록 제외)
-    raw_text = next(
-        (b.text for b in message.content if getattr(b, "type", None) == "text"), ""
+    llm_result = call_analysis_llm(
+        system_prompt=SYSTEM_PROMPT,
+        user_prompt=prompt,
+        schema=_analysis_tool_schema(),
+        extract_json=_extract_analysis_json,
+        prompt_cache_enabled=PROMPT_CACHE_ENABLED,
     )
-    tool_json = None
-    for b in message.content:
-        if getattr(b, "type", None) == "tool_use" and getattr(b, "name", None) == "record_analysis":
-            inp = getattr(b, "input", None)
-            if isinstance(inp, dict):
-                tool_json = inp
-                break
 
-    # Tool Use 가 활성화·성공이면 tool_json 우선, 아니면 regex 추출 폴백
-    analysis_json = tool_json if tool_json is not None else _extract_analysis_json(raw_text)
+    raw_text = llm_result.raw_text
+    analysis_json = llm_result.analysis_json or _extract_analysis_json(raw_text)
     analysis_adjustments: list[str] = []
     if isinstance(analysis_json, dict) and analysis_json:
         analysis_json, analysis_adjustments = _normalize_analysis_json(analysis_json)
@@ -1352,7 +1356,7 @@ def analyze_with_claude(
 
     signal, confidence = parse_signal(report_text)
     trade_levels = parse_trade_levels(report_text)
-    claude_leverage = parse_leverage(report_text)
+    llm_leverage = parse_leverage(report_text)
 
     structured_signal = _signal_from_structured(analysis_json)
     structured_confidence = _int_or_none(
@@ -1367,13 +1371,33 @@ def analyze_with_claude(
     if structured_confidence is not None:
         confidence = structured_confidence
     if structured_leverage is not None:
-        claude_leverage = structured_leverage
+        llm_leverage = structured_leverage
 
     structured_levels = _levels_from_structured(analysis_json)
     for key, value in structured_levels.items():
         if value is not None:
             trade_levels[key] = value
 
+    decision = shared_context_raw.get("decision_support", {})
+    canonical_view = {
+        "매수": "상방 우위",
+        "매도": "하방 우위",
+        "홀드": "중립",
+    }.get(signal, "중립")
+    # The final analyst market view is authoritative for the market layer only.
+    # Account restrictions are preserved independently inside account_overlay.
+    decision["market_direction"] = canonical_view
+    decision["market_signal"] = canonical_view
+    analysis_price = None
+    for tf in ("5m", "15m", "1h", "4h", "1d"):
+        try:
+            if tf in multi_tf_data and len(multi_tf_data[tf]) > 0:
+                analysis_price = float(multi_tf_data[tf].iloc[-1]["close"])
+                break
+        except Exception:
+            continue
+    apply_trade_quality(decision, analysis_price, trade_levels, report_text)
+    report_text = append_decision_report_sections(report_text, decision, analysis_json)
     # Judge 결과 추출 (signal processing 에 활용)
     judge_result = (
         pipeline.judge if pipeline is not None else None
@@ -1416,7 +1440,8 @@ def analyze_with_claude(
         "signal":       signal,
         "confidence":   confidence,
         "raw_text":     report_text,
-        "raw_response":  raw_text,
+        "raw_response":  llm_result.raw_response,
+        "decision_support": shared_context_raw.get("decision_support", {}),
         "analysis_json": analysis_json,
         "trade_levels": trade_levels,
         "prompt_used":  prompt,
@@ -1424,10 +1449,11 @@ def analyze_with_claude(
         "report_format_ok": report_meta["format_ok"],
         "report_missing_sections": report_meta["missing_sections"],
         "report_generated_from_json": report_generated_from_json,
-        "structured_output_used": tool_json is not None,
+        "structured_output_used": llm_result.structured_output_used,
         "analysis_adjustments": analysis_adjustments,
         "trading_signal": trading_signal_dict,
-        "claude_leverage": claude_leverage,
+        "llm_leverage": llm_leverage,
+        "claude_leverage": llm_leverage,
         "consistency":  consistency,
         "debate":       (
             pipeline.debate.to_payload() if pipeline is not None and pipeline.debate
@@ -1445,6 +1471,11 @@ def analyze_with_claude(
             list(pipeline.memories) if pipeline is not None else []
         ),
     }
+
+
+def analyze_with_claude(*args, **kwargs) -> dict:
+    """Backward-compatible wrapper for older imports."""
+    return analyze_with_llm(*args, **kwargs)
 
 
 def run_full_analysis(
@@ -1524,6 +1555,7 @@ def run_full_analysis(
         progress_cb=progress_cb,
         agent_memories=agent_memories_obj,
         price_at_analysis=price_at_analysis,   # ← reflection baseline
+        decision_support=raw_ctx.get("decision_support"),
     )
 
     # 3-a) 직전 분석 대비 변화 블록 (Δ context)
@@ -1557,12 +1589,14 @@ def run_full_analysis(
     if progress_cb:
         progress_cb("final", "최종 애널리스트 종합 중")
 
-    result = analyze_with_claude(
+    result = analyze_with_llm(
         multi_tf_data,
         macro_snapshot=macro_snapshot,
         pipeline=pipeline,
         delta_block=delta_block_str,
         lessons_block=lessons_block_str,
+        context_blob=context_blob,
+        raw_context=raw_ctx,
     )
 
     # 5) 메모리에 이번 상황-조언 페어 기록 (reflection 을 위한 씨앗)

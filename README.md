@@ -1,11 +1,11 @@
 # ₿ BTC Signal Analyzer
 
-AI 기반 비트코인 트레이딩 신호 분석 대시보드.
-Binance 실시간 선물 데이터 + Claude AI 분석 + 거시경제 지표를 하나의 웹 인터페이스로 제공합니다.
+개인 로컬 전용 비트코인 시장 분석 대시보드.
+Binance/Bybit 시장 데이터 + provider-agnostic LLM 분석 + 거시경제 지표를 하나의 웹 인터페이스로 제공합니다.
 
 ![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-green?logo=fastapi)
-![Claude](https://img.shields.io/badge/Claude-Anthropic-orange)
+![LLM](https://img.shields.io/badge/LLM-OpenAI%20compatible-blue)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
 ---
@@ -18,11 +18,12 @@ Binance 실시간 선물 데이터 + Claude AI 분석 + 거시경제 지표를 �
 - ECharts 기반 캔들스틱 차트 (볼린저 밴드, EMA, SMA 오버레이)
 - RSI · MACD · 거래량 서브차트 실시간 업데이트
 
-### 🤖 Claude AI 분석
-- 멀티 타임프레임 기술적 지표를 종합한 Claude 분석 리포트
+### 🤖 LLM 분석
+- Anthropic Claude, OpenAI, OpenAI-compatible Chat Completions 엔드포인트 지원
+- 멀티 타임프레임 기술적 지표를 종합한 분석 리포트
 - 롱/숏/관망 신호 + 신뢰도 점수 출력
 - 진입가 · 목표가 · 손절가 자동 산출
-- AI와 후속 질문 채팅 가능 (분석 컨텍스트 공유)
+- 자동매매나 주문 실행 기능은 제공하지 않습니다.
 
 ### 🌍 거시경제 지표
 매크로 환경이 BTC에 미치는 영향을 실시간 카드로 표시합니다.
@@ -48,7 +49,7 @@ Binance 실시간 선물 데이터 + Claude AI 분석 + 거시경제 지표를 �
 
 ### 🔑 웹 기반 API 키 설정
 - 최초 실행 시 키 입력 모달 자동 표시
-- Claude API 키 (필수) / Binance API (선택)
+- LLM API 키 (분석 실행 시 필수) / Binance API (계좌 조회 시 선택)
 - 입력값은 로컬 `.env` 파일에만 저장 — 서버 재시작 없이 반영
 
 ---
@@ -59,32 +60,51 @@ Binance 실시간 선물 데이터 + Claude AI 분석 + 거시경제 지표를 �
 
 ```bash
 git clone https://github.com/likegyu/bitcoin-trading-manager.git
-cd bitcoin-trading-manager/crypto_analyzer
+cd bitcoin-trading-manager
 ```
 
-### 2. API 키 준비
+### 2. 로컬 openai-oauth 프록시 실행
 
-| 키 | 필수 여부 | 발급 주소 |
-|----|----------|----------|
-| Claude API Key | ✅ 필수 | [console.anthropic.com](https://console.anthropic.com) |
-| Binance API Key + Secret | ✅ 필수 | [binance.com → API 관리](https://www.binance.com/ko/my/settings/api-management) |
+OpenAI 종량제 API key 없이 로컬 프록시를 기본 provider로 사용합니다.
 
-> FRED API 키는 더 이상 필요하지 않습니다. 금리·달러 데이터는 yfinance 실시간 시세로 대체되었습니다.
+```bash
+node packages/openai-oauth/dist/cli.js --port 10532 --models gpt-5.6-sol --reasoning-effort medium
+```
 
-> **Binance API 권한 설정:** 읽기 전용 + **선물 거래(Enable Futures)** 권한이 필요합니다. 출금(Withdrawal) 권한은 절대 부여하지 마세요.
+### 3. `.env` 설정
 
-### 3. 서버 실행
+```env
+LLM_PROVIDER=openai_oauth
+LLM_BASE_URL=http://127.0.0.1:10532/v1
+LLM_MODEL=gpt-5.6-sol
+LLM_API_KEY=
+ANALYSIS_COOLDOWN_SECS=0
+ANALYSIS_DEBOUNCE_SECS=5
+PREVENT_CONCURRENT_ANALYSIS=true
+```
+
+### 4. 분석기 실행
 
 ```bash
 ./run.sh
 ```
 
-`run.sh`가 패키지 설치 → `.env` 확인 → 서버 기동을 자동으로 처리합니다.
 브라우저에서 **http://localhost:8000** 접속.
 
-### 4. API 키 입력 (선택적)
+### 선택: API 키 준비
 
-`.env` 파일이 없거나 Claude 키가 없으면 시작 시 설정 모달이 자동으로 뜹니다.
+| 키 | 필수 여부 | 발급 주소 |
+|----|----------|----------|
+| LLM API Key | openai_oauth 사용 시 불필요 | OpenAI, Anthropic 또는 호환 provider |
+| Binance API Key + Secret | 선택 | [binance.com → API 관리](https://www.binance.com/ko/my/settings/api-management) |
+
+> FRED API 키는 더 이상 필요하지 않습니다. 금리·달러 데이터는 yfinance 실시간 시세로 대체되었습니다.
+
+> **Binance API 권한 설정:** 분석 전용이면 read-only 권한만 권장합니다. 출금(Withdrawal) 권한은 절대 부여하지 말고, 주문/선물 거래 권한도 켜지 마세요.
+
+### 웹 설정 모달
+
+`openai_oauth` 기본값에서는 LLM API key 없이 configured 상태로 동작합니다.
 직접 입력하거나 `.env.example`을 복사해 사용할 수 있습니다.
 
 ```bash
@@ -92,14 +112,44 @@ cp .env.example .env
 # 열어서 값 입력
 ```
 
+OpenAI 예시:
+
+```env
+LLM_PROVIDER=openai
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_API_KEY=sk-your_key
+LLM_MODEL=gpt-4.1-mini
+LLM_MAX_TOKENS=8000
+LLM_TEMPERATURE=0.2
+LLM_TIMEOUT_SECS=120
+```
+
+OpenAI-compatible 예시:
+
+```env
+LLM_PROVIDER=openai_compatible
+LLM_BASE_URL=https://your-provider.example/v1
+LLM_API_KEY=your_key
+LLM_MODEL=your-chat-model
+```
+
+Anthropic 예시:
+
+```env
+LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-your_key
+ANTHROPIC_MODEL=claude-sonnet-4-6
+```
+
 ---
 
 ## 프로젝트 구조
 
 ```
-crypto_analyzer/
+bitcoin-trading-manager/
 ├── server.py            # FastAPI 메인 서버 (SSE 스트리밍, API 라우트)
-├── analyzer.py          # Claude 프롬프트 빌드 & 응답 파싱
+├── analyzer.py          # LLM 프롬프트 빌드 & 응답 파싱
+├── llm_client.py        # Anthropic/OpenAI-compatible provider 클라이언트
 ├── account_history.py   # 계좌 히스토리 저장 & 운영 맥락 요약
 ├── macro_history.py     # 거시 히스토리 저장 & 24h·72h·7d 요약
 ├── macro_fetcher.py     # 거시경제 지표 수집 (yfinance / DefiLlama / CoinGecko)
@@ -124,7 +174,7 @@ crypto_analyzer/
 |------|------|
 | 백엔드 | FastAPI · Uvicorn · Python 3.9+ |
 | 실시간 통신 | WebSocket (Binance) · SSE (Server-Sent Events) |
-| AI | Anthropic Claude API |
+| AI | Anthropic Claude · OpenAI Chat Completions · OpenAI-compatible endpoints |
 | 데이터 | Binance Futures REST/WS · yfinance · DefiLlama · CoinGecko |
 | 차트 | Apache ECharts 5 |
 | 프론트엔드 | Vanilla JS · HTML/CSS (단일 파일, 빌드 도구 없음) |
@@ -153,7 +203,8 @@ crypto_analyzer/
 
 - **투자 조언이 아닙니다.** 본 프로젝트는 데이터 분석 도구이며, 매매 결과에 대한 책임은 사용자에게 있습니다.
 - API 키는 절대 외부에 공유하지 마세요. `.env` 파일은 `.gitignore`에 포함되어 있습니다.
-- Binance API 키 생성 시 **읽기 전용 + 선물 거래(Enable Futures) 권한만** 부여하세요. 출금(Withdrawal) 권한은 절대 추가하지 마세요.
+- Binance API 키 생성 시 분석 전용이면 **읽기 전용 권한만** 부여하세요. 출금(Withdrawal) 권한은 절대 추가하지 말고, 주문/선물 거래 권한도 켜지 마세요.
+- 이 프로젝트는 분석 리포트와 대시보드만 제공합니다. 자동매매/주문 실행 엔드포인트는 없습니다.
 
 ---
 

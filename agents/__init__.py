@@ -12,9 +12,9 @@
 #   - Phase 5: Signal Processing (signal_processing.py)
 #
 # 철학:
-#   - LangGraph/LangChain 의존성 없이 순수 anthropic SDK 로 동작
+#   - LangGraph/LangChain 의존성 없이 provider-agnostic LLM client 로 동작
 #   - 각 에이전트는 역할별 독립 메모리를 갖고 재귀적으로 개선됨
-#   - 최종 종합은 analyzer.analyze_with_claude() 가 담당
+#   - 최종 종합은 analyzer.analyze_with_llm() 가 담당
 # =============================================
 
 import logging as _logging

@@ -35,6 +35,13 @@ def _as_float(value: Any) -> float | None:
     return num
 
 
+def _first_present(mapping: dict, *keys: str) -> Any:
+    for key in keys:
+        if key in mapping and mapping.get(key) is not None:
+            return mapping.get(key)
+    return None
+
+
 def _fmt_money(value: float | None) -> str:
     if value is None:
         return "N/A"
@@ -180,6 +187,13 @@ def _position_signature(positions: list[dict]) -> str:
 
 def _snapshot_from_context(ctx: dict, observed_at: datetime | None = None) -> dict:
     observed = observed_at or datetime.now(timezone.utc)
+
+    # ── Gate.io provider 어댑터 ──────────────────────
+    # Gate ctx: "positions" 키, Binance ctx: "open_positions" 키
+    provider = ctx.get("provider", "")
+    if provider == "gateio":
+        return _gate_snapshot_from_context(ctx, observed)
+
     positions = ctx.get("open_positions")
     position_list = positions if isinstance(positions, list) else []
 
@@ -230,13 +244,113 @@ def _snapshot_from_context(ctx: dict, observed_at: datetime | None = None) -> di
     return snapshot
 
 
+def _gate_snapshot_from_context(ctx: dict, observed: "datetime") -> dict:
+    """Gate.io provider ctx → account_history 호환 스냅샷.
+
+    Gate ctx는 Binance ctx와 키 이름이 다름:
+    - positions (list)       vs open_positions
+    - account.available      vs available_balance
+    - account_equity         (공통 - account_context.py에서 이미 세팅)
+    """
+    account   = ctx.get("account") or {}
+    wallet    = ctx.get("wallet")  or {}
+    positions = ctx.get("positions") or []
+
+    account_equity = _as_float(ctx.get("account_equity"))
+    wallet_balance = _as_float(ctx.get("wallet_balance"))
+    if wallet_balance is None:
+        wallet_balance = _as_float(wallet.get("total_amount"))
+    available      = _as_float(ctx.get("available_balance") or account.get("available"))
+    upnl           = _as_float(_first_present(ctx, "unrealised_pnl", "unrealized_pnl"))
+    if upnl is None:
+        upnl = _as_float(_first_present(account, "unrealised_pnl", "unrealized_pnl"))
+
+    # 포지션 집계
+    long_notional  = 0.0
+    short_notional = 0.0
+    top_pos: list[str] = []   # str 리스트 — _build_section과 호환
+    pos_syms: list = []
+    for p in positions:
+        # Gate position에는 notional이 없음 → size * mark_price 로 계산
+        size  = _as_float(p.get("size")) or 0.0
+        mark  = _as_float(p.get("mark_price")) or 0.0
+        notional = size * mark
+        if p.get("side") == "숏":
+            short_notional += notional
+        else:
+            long_notional += notional
+        contract = p.get("contract") or p.get("symbol") or "N/A"
+        side     = p.get("side", "포지션")
+        pos_syms.append(contract)
+        if len(top_pos) < 3:
+            top_pos.append(
+                f"{contract} {side} {_fmt_money(notional)}" if notional > 0
+                else f"{contract} {side}"
+            )
+
+    pos_sig = "|".join(
+        f"{p.get('contract') or p.get('symbol')}:{p.get('side')}:{p.get('size')}"
+        for p in positions
+    )
+
+    return {
+        "observed_at":           observed.isoformat(),
+        "observed_label":        format_kst(observed, "%m-%d %H:%M"),
+        "observed_ts":           observed.timestamp(),
+        "provider":              "gateio",
+        # Binance 호환 필드 (성과 대시보드에서 account_equity로 차트)
+        "wallet_balance":        wallet_balance,
+        "available_balance":     available,
+        "margin_balance":        None,
+        "account_equity":        account_equity,
+        "total_assets":          _as_float(ctx.get("total_assets")),
+        "wallet_total_balance":  _as_float(ctx.get("wallet_total_balance")),
+        "futures_account_equity": _as_float(ctx.get("futures_account_equity")),
+        "day_start_equity":      _as_float(ctx.get("day_start_equity")),
+        "today_total_pnl":       _as_float(ctx.get("today_total_pnl")),
+        "today_cash_pnl":        None,
+        "today_eval_pnl":        _as_float(ctx.get("today_eval_pnl")),
+        "today_commission_fee":  None,
+        "today_total_mode":      ctx.get("today_total_mode"),
+        "today_total_label":     ctx.get("today_total_label"),
+        "day_anchor_source":     ctx.get("day_anchor_source"),
+        "today_pnl_pct":         _as_float(ctx.get("today_pnl_pct")),
+        "open_position_count":   len(positions),
+        "open_position_notional": round(long_notional + short_notional, 2),
+        "open_position_upnl":    upnl,
+        "open_order_count":      len(ctx.get("open_orders") or []),
+        "open_order_notional":   _as_float(ctx.get("open_order_notional")),
+        "order_margin":          _as_float(ctx.get("order_margin")),
+        "effective_leverage":    _as_float(ctx.get("effective_leverage")),
+        "account_actual_leverage": _as_float(ctx.get("account_actual_leverage")),
+        "account_gross_leverage": _as_float(ctx.get("account_gross_leverage")),
+        "account_net_leverage":  _as_float(ctx.get("account_net_leverage")),
+        "hedge_offset_ratio":    _as_float(ctx.get("hedge_offset_ratio")),
+        "position_actual_leverage": _as_float(ctx.get("position_actual_leverage")),
+        "risk_status":           ctx.get("risk_status"),
+        "long_notional":         round(long_notional, 2),
+        "short_notional":        round(short_notional, 2),
+        "exposure_bias":         _bias_from_notional(long_notional, short_notional),
+        "position_symbols":      pos_syms,
+        "top_positions":         top_pos,
+        "position_signature":    pos_sig,
+        "carryover_positions":   list(ctx.get("carryover_positions") or []),
+    }
+
+
 def _is_observable(snapshot: dict) -> bool:
+    # Gate snapshot: account_equity 또는 open_position_count 있으면 관측 가능
+    if snapshot.get("account_equity") is not None:
+        return True
     for field in (
         "wallet_balance",
         "today_total_pnl",
         "open_position_count",
         "open_position_notional",
         "open_position_upnl",
+        "open_order_count",
+        "open_order_notional",
+        "order_margin",
         "effective_leverage",
     ):
         if snapshot.get(field) is not None:
@@ -724,7 +838,7 @@ class AccountContextTimeline:
         current_equity = _as_float(ctx.get("account_equity"))
         if current_equity is None:
             wallet = _as_float(ctx.get("wallet_balance"))
-            upnl = _as_float(ctx.get("unrealized_pnl"))
+            upnl = _as_float(_first_present(ctx, "unrealized_pnl", "unrealised_pnl"))
             if wallet is not None and upnl is not None:
                 current_equity = wallet + upnl
             else:
@@ -753,6 +867,9 @@ class AccountContextTimeline:
             eval_pnl = current_equity - start_equity
 
         positions = ctx.get("open_positions")
+        # Gate provider: "positions" 키 사용 — open_positions 없으면 fallback
+        if not isinstance(positions, list):
+            positions = ctx.get("positions")
         position_list = positions if isinstance(positions, list) else []
         carryover_positions = _carryover_positions(
             reliable_prev_snapshot,

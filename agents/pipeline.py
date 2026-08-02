@@ -6,7 +6,7 @@
 #   2) Investment Judge  (judge.py)
 #   3) Risk Triad        (risk_triad.py)
 #   4) Memory Recall     (memory.py — FinancialSituationMemory)
-#   5) 최종 통합 블록 조립 → analyzer.analyze_with_claude() 에 주입
+#   5) 최종 통합 블록 조립 → analyzer.analyze_with_llm() 에 주입
 #
 # 에이전트별 메모리 쓰기:
 #   - Bull/Bear debate 발언 → bull/bear 역할 메모리에 기록
@@ -145,6 +145,7 @@ def run_pipeline(
     progress_cb: Optional[ProgressCallback] = None,
     agent_memories: Optional["AgentMemories"] = None,
     price_at_analysis: Optional[float] = None,
+    decision_support: Optional[dict] = None,
 ) -> PipelineResult:
     """
     전체 에이전트 파이프라인 실행.
@@ -225,6 +226,7 @@ def run_pipeline(
             agent_memories=agent_memories,
             memory_query=_query,
             progress_cb=None,  # progress_cb 은 이미 위에서 emit 함
+            decision_support=decision_support,
         )
         # Judge 역할 메모리 기록
         if (
@@ -263,6 +265,7 @@ def run_pipeline(
             agent_memories=agent_memories,
             memory_query=_query,
             judge_block=_judge_block_text,
+            decision_support=decision_support,
         )
         # Risk 역할 메모리 기록
         if agent_memories is not None and risk is not None and risk.enabled:

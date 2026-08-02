@@ -16,13 +16,11 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from dataclasses import dataclass
 from typing import Optional
 
-import anthropic
-
-from config import CLAUDE_API_KEY
+import config
+from llm_client import call_text_llm
 from .memory import FinancialSituationMemory, get_memory
 
 
@@ -160,29 +158,13 @@ class ReflectionResult:
         }
 
 
-def _call_llm(client: anthropic.Anthropic, system: str, user: str) -> str:
-    max_retries = 3
-    wait = 8
-    for attempt in range(max_retries):
-        try:
-            msg = client.messages.create(
-                model=REFLECTION_MODEL,
-                # 5000 → 6500 상향 — 회고 본문이 길어질 때 마지막 권고 잘림 방지
-                max_tokens=6500,
-                system=system,
-                messages=[{"role": "user", "content": user}],
-            )
-            if not hasattr(msg, "content") or not isinstance(msg.content, list):
-                raise RuntimeError(
-                    f"API 응답 형식 오류 — {type(msg).__name__}: {msg!r:.200}"
-                )
-            return next((b.text for b in msg.content if b.type == "text"), "").strip()
-        except anthropic.APIStatusError as e:
-            if e.status_code in (429, 529) and attempt < max_retries - 1:
-                time.sleep(wait)
-                wait *= 2
-                continue
-            raise
+def _call_llm(system: str, user: str) -> str:
+    return call_text_llm(
+        system_prompt=system,
+        user_prompt=user,
+        # 5000 → 6500 상향 — 회고 본문이 길어질 때 마지막 권고 잘림 방지
+        max_tokens=6500,
+    )
 
 
 def _elapsed_label(seconds: float) -> str:
@@ -358,7 +340,7 @@ def reflect_for_role(
     if memory is None:
         memory = get_memory(role)
 
-    if not CLAUDE_API_KEY:
+    if not config.llm_api_key_configured():
         return ReflectionResult(
             timestamp=record_ts,
             role=role,
@@ -367,7 +349,7 @@ def reflect_for_role(
             pct_change=0.0,
             reflection_text="",
             updated=False,
-            error="CLAUDE_API_KEY 미설정",
+            error="LLM 설정 미완료",
         )
 
     # 가격 변화 계산
@@ -393,9 +375,8 @@ def reflect_for_role(
         elapsed_label=_elapsed_label(elapsed_seconds),
     )
 
-    client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     try:
-        reflection_text = _call_llm(client, system_prompt, prompt)
+        reflection_text = _call_llm(system_prompt, prompt)
     except Exception as exc:
         return ReflectionResult(
             timestamp=record_ts,

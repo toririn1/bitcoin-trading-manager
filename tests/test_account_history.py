@@ -145,6 +145,32 @@ class AccountHistoryDayAnchorTests(unittest.TestCase):
         self.assertEqual(current["day_anchor_source"], "day_start")
         self.assertEqual(current["carryover_positions"], ["BTCUSDC 롱 $10,000.00"])
 
+    def test_gate_unrealised_pnl_spelling_updates_equity_snapshot(self):
+        current = {
+            "provider": "gateio",
+            "wallet_balance": 1000.0,
+            "available_balance": 700.0,
+            "unrealised_pnl": 50.0,
+            "positions": [
+                {
+                    "symbol": "BTC_USDT",
+                    "side": "롱",
+                    "size": 0.1,
+                    "mark_price": 60000.0,
+                }
+            ],
+            "today_cash_pnl": 0.0,
+        }
+
+        self.timeline.observe(current)
+        self.assertAlmostEqual(current["account_equity"], 1050.0)
+
+        snapshot = self.timeline._entries[-1]
+        self.assertAlmostEqual(snapshot["account_equity"], 1050.0)
+        self.assertAlmostEqual(snapshot["open_position_upnl"], 50.0)
+        self.assertEqual(snapshot["position_symbols"], ["BTC_USDT"])
+        self.assertEqual(snapshot["position_signature"], "BTC_USDT:롱:0.1")
+
 
 if __name__ == "__main__":
     unittest.main()
