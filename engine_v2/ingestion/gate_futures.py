@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -53,8 +53,13 @@ class GateFuturesProvider(MarketDataProvider):
             if not isinstance(row, dict):
                 continue
             event_time = _dt_epoch(row.get("t") or row.get("timestamp"))
-            candle = Candle(product.product_id, timeframe, event_time or now, None, _number(row.get("o")), _number(row.get("h")), _number(row.get("l")), _number(row.get("c")), _number(row.get("v")), _number(row.get("sum")), None, True, self.name, now, now, DataQuality.OK if event_time else DataQuality.TIMESTAMP_UNKNOWN)
-            observations.append(Observation(str(uuid4()), self.name, self.capabilities.venue, product.product_id, f"candle_{timeframe}", event_time, None, now, now, now, None, candle.quality, "2.0", candle.to_dict(), None if event_time else "candle_time_missing"))
+            interval_seconds = _interval_seconds(timeframe)
+            close_time = event_time + timedelta(seconds=interval_seconds) if event_time else None
+            is_final = close_time <= now if close_time else None
+            quality = DataQuality.OK if event_time and close_time else DataQuality.TIMESTAMP_UNKNOWN
+            candle = Candle(product.product_id, timeframe, event_time or now, close_time, _number(row.get("o")), _number(row.get("h")), _number(row.get("l")), _number(row.get("c")), _number(row.get("v")), _number(row.get("sum")), None, is_final, self.name, now, now, quality)
+            reason = None if quality == DataQuality.OK else "candle_time_missing"
+            observations.append(Observation(str(uuid4()), self.name, self.capabilities.venue, product.product_id, f"candle_{timeframe}", event_time, None, now, now, now, None, candle.quality, "2.0", candle.to_dict(), reason))
         return ProviderResult(self.name, data=observations, request_count=1)
 
 
@@ -68,6 +73,10 @@ def _number(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if number == number and abs(number) != float("inf") else None
+
+
+def _interval_seconds(timeframe: str) -> int:
+    return {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}.get(timeframe, 900)
 
 
 def _dt_epoch(value: Any) -> datetime | None:

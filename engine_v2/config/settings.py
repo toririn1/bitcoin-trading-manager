@@ -33,7 +33,8 @@ class V2Settings:
     legacy_engine_enabled: bool = False
     legacy_debate_enabled: bool = False
     shadow_mode: bool = True
-    live_enabled: bool = False
+    mode: str = "live"
+    live_enabled: bool = True
     duckdb_path: str = "data/v2/engine.duckdb"
     parquet_root: str = "data/v2/raw"
     retention_days: int = 90
@@ -51,6 +52,8 @@ class V2Settings:
     minimum_overlap_ratio: float = 0.6
     minimum_stability: float = 0.25
     data_dir: str = "data/v2"
+    replay_time: str | None = None
+    shadow_interval_seconds: int = 300
 
     @classmethod
     def from_env(cls) -> "V2Settings":
@@ -59,7 +62,8 @@ class V2Settings:
             legacy_engine_enabled=_bool("LEGACY_ENGINE_ENABLED", False),
             legacy_debate_enabled=_bool("LEGACY_DEBATE_ENABLED", False),
             shadow_mode=_bool("ENGINE_V2_SHADOW_MODE", True),
-            live_enabled=_bool("V2_LIVE_ENABLED", False),
+            mode=_mode(),
+            live_enabled=_bool("V2_LIVE_ENABLED", True),
             duckdb_path=_env("V2_DUCKDB_PATH", "data/v2/engine.duckdb"),
             parquet_root=_env("V2_PARQUET_ROOT", "data/v2/raw"),
             retention_days=_int("V2_RETENTION_DAYS", 90),
@@ -72,6 +76,8 @@ class V2Settings:
             request_timeout_seconds=_float("V2_REQUEST_TIMEOUT_SECONDS", 8.0),
             max_retries=_int("V2_MAX_RETRIES", 2),
             data_dir=_env("V2_DATA_DIR", "data/v2"),
+            replay_time=_env("V2_REPLAY_TIME", "") or None,
+            shadow_interval_seconds=_int("V2_SHADOW_INTERVAL_SECONDS", 300),
         )
 
     def ensure_dirs(self, root: Path) -> None:
@@ -84,6 +90,7 @@ class V2Settings:
             "legacy_engine_enabled": self.legacy_engine_enabled,
             "legacy_debate_enabled": self.legacy_debate_enabled,
             "shadow_mode": self.shadow_mode,
+            "mode": self.mode,
             "live_enabled": self.live_enabled,
             "retention_days": self.retention_days,
             "min_data_quality": self.min_data_quality,
@@ -95,6 +102,11 @@ class V2Settings:
             "minimum_sample_count": self.minimum_sample_count,
             "minimum_overlap_ratio": self.minimum_overlap_ratio,
         }
+
+
+def _mode() -> str:
+    value = _env("V2_MODE", "live").lower()
+    return value if value in {"live", "fixture", "replay"} else "live"
 
 
 settings = V2Settings.from_env()

@@ -17,16 +17,57 @@ FACTOR_MEMBERS = {
 }
 
 
-def factor_state(asset_returns: dict[str, float | None], *, weights: dict[str, float] | None = None) -> dict[str, Any]:
+def factor_state(asset_returns: dict[str, Any], *, weights: dict[str, float] | None = None) -> dict[str, Any]:
     weights = weights or {}
     states = {}
     for factor, members in FACTOR_MEMBERS.items():
-        values = [(asset_returns.get(member), weights.get(member, 1.0)) for member in members if asset_returns.get(member) is not None]
+        values = []
+        for member in members:
+            raw = asset_returns.get(member)
+            if isinstance(raw, dict):
+                value = raw.get("return")
+                age = raw.get("source_age")
+                quality = raw.get("quality", "unknown")
+            else:
+                value = raw
+                age = None
+                quality = "ok" if value is not None else "insufficient_data"
+            try:
+                value = float(value) if value is not None else None
+            except (TypeError, ValueError):
+                value = None
+            if value is not None:
+                values.append((member, value, weights.get(member, 1.0), age, quality))
         if not values:
-            states[factor] = {"value": None, "sample_count": 0, "quality": "insufficient_data", "members_used": []}
+            states[factor] = {
+                "value": None,
+                "return": None,
+                "zscore": None,
+                "stability": None,
+                "sample_count": 0,
+                "quality": "insufficient_data",
+                "members_used": [],
+                "member_weights": {},
+                "source_age": None,
+            }
             continue
-        total = sum(weight for _, weight in values)
-        states[factor] = {"value": sum(float(value) * weight for value, weight in values) / total, "sample_count": len(values), "quality": "ok" if len(values) >= 2 else "partial", "members_used": [members[index] for index, item in enumerate(values) if item[0] is not None]}
+        total_weight = sum(weight for _, _, weight, _, _ in values)
+        factor_value = sum(value * weight for _, value, weight, _, _ in values) / total_weight
+        sample = [value for _, value, _, _, _ in values]
+        mean = sum(sample) / len(sample)
+        variance = sum((value - mean) ** 2 for value in sample) / (len(sample) - 1) if len(sample) > 1 else 0
+        std = variance ** 0.5
+        states[factor] = {
+            "value": factor_value,
+            "return": factor_value,
+            "zscore": (factor_value - mean) / std if std else 0.0,
+            "stability": None,
+            "sample_count": len(values),
+            "quality": "ok" if len(values) >= 2 and all(item[4] in {"ok", "partial", "delayed"} for item in values) else "partial",
+            "members_used": [member for member, _, _, _, _ in values],
+            "member_weights": {member: weight for member, _, weight, _, _ in values},
+            "source_age": max((age for _, _, _, age, _ in values if age is not None), default=None),
+        }
     return states
 
 

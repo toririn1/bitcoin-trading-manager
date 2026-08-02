@@ -24,18 +24,37 @@ class JSONResponse:
     latency_ms: float
 
 
-def _get(url: str, params: dict[str, object], timeout: float) -> JSONResponse:
+def _get(
+    url: str,
+    params: dict[str, object],
+    timeout: float,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
     query = urlencode({key: value for key, value in params.items() if value is not None})
     full_url = f"{url}?{query}" if query else url
     started = time.perf_counter()
-    request = Request(full_url, headers={"Accept": "application/json", "User-Agent": "bitcoin-trading-manager-v2/1.0"}, method="GET")
+    request_headers = {
+        "Accept": "application/json",
+        "User-Agent": "bitcoin-trading-manager-v2/1.0",
+    }
+    request_headers.update(headers or {})
+    request = Request(full_url, headers=request_headers, method="GET")
     try:
         with urlopen(request, timeout=timeout) as response:
             raw = response.read()
-            headers = {key.lower(): value for key, value in response.headers.items()}
-            return JSONResponse(json.loads(raw.decode("utf-8")), response.status, headers, (time.perf_counter() - started) * 1000)
+            response_headers = {key.lower(): value for key, value in response.headers.items()}
+            return JSONResponse(
+                json.loads(raw.decode("utf-8")),
+                response.status,
+                response_headers,
+                (time.perf_counter() - started) * 1000,
+            )
     except HTTPError as exc:
-        raise ProviderHTTPError(f"http_{exc.code}", status=exc.code, headers=dict(exc.headers.items())) from exc
+        raise ProviderHTTPError(
+            f"http_{exc.code}",
+            status=exc.code,
+            headers=dict(exc.headers.items()),
+        ) from exc
     except (URLError, TimeoutError, json.JSONDecodeError) as exc:
         raise ProviderHTTPError(type(exc).__name__) from exc
 
@@ -44,5 +63,10 @@ class AsyncJSONClient:
     def __init__(self, timeout: float = 8.0) -> None:
         self.timeout = timeout
 
-    async def get(self, url: str, params: dict[str, object] | None = None) -> JSONResponse:
-        return await asyncio.to_thread(_get, url, params or {}, self.timeout)
+    async def get(
+        self,
+        url: str,
+        params: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> JSONResponse:
+        return await asyncio.to_thread(_get, url, params or {}, self.timeout, headers)

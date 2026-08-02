@@ -8,7 +8,7 @@ def _rows(candles: Iterable[Any], *, closed_only: bool = True) -> list[dict[str,
     rows = []
     for candle in candles:
         row = candle.to_dict() if hasattr(candle, "to_dict") else dict(candle)
-        if closed_only and not bool(row.get("is_final", False)):
+        if closed_only and row.get("is_final") is not True:
             continue
         if row.get("close") is None:
             continue
@@ -62,7 +62,7 @@ def closed_candle_features(candles: Iterable[Any], *, minimum_samples: int = 30)
     latest = values[-1] if values else None
     output: dict[str, Any] = {
         "closed_candle_count": len(rows),
-        "forming_candle_count": sum(1 for row in _rows(candles, closed_only=False) if not row.get("is_final", False)),
+        "forming_candle_count": sum(1 for row in _rows(candles, closed_only=False) if row.get("is_final") is False),
         "latest_close": latest,
         "latest_close_quality": "ok" if latest is not None and len(values) >= minimum_samples else "insufficient_data",
     }

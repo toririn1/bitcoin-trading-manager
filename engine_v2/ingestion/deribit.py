@@ -42,7 +42,7 @@ class DeribitOptionsProvider(MarketDataProvider):
                 name = str(item.get("instrument_name") or "")
                 if not name:
                     continue
-                products.append(ProductSpec(f"{currency}_DERIBIT_OPTION_{name}", currency, self.name, "deribit", name, ProductType.FUTURE, quote_currency="USD", settlement_currency=item.get("settlement_currency"), contract_size=_number(item.get("contract_size")), tick_size=_number(item.get("tick_size")), short_supported=True, price_source="deribit_public", is_tradable=False, capabilities={"instrument": item}, discovered_at=datetime.now(timezone.utc)))
+                products.append(ProductSpec(f"{currency}_DERIBIT_OPTION_{name}", currency, self.name, "deribit", name, ProductType.OPTION, quote_currency="USD", settlement_currency=item.get("settlement_currency"), contract_size=_number(item.get("contract_size")), tick_size=_number(item.get("tick_size")), short_supported=True, price_source="deribit_public", is_tradable=False, capabilities={"instrument": item}, discovered_at=datetime.now(timezone.utc)))
         return ProviderResult(self.name, products=products, request_count=requests)
 
     async def backfill(self, product: ProductSpec, *, timeframe: str = "15m", limit: int = 300) -> ProviderResult:
@@ -51,7 +51,7 @@ class DeribitOptionsProvider(MarketDataProvider):
         collected = datetime.now(timezone.utc)
         event_time = _dt_ms(payload.get("timestamp"))
         quality = DataQuality.OK if event_time and payload.get("greeks") else DataQuality.PARTIAL
-        observation = Observation(str(uuid4()), self.name, "deribit", product.product_id, "option", event_time, None, collected, collected, collected, None, quality, "2.0", {"instrument_name": product.venue_symbol, "underlying_price": _number(payload.get("underlying_price")), "mark_price": _number(payload.get("mark_price")), "mark_iv": _number(payload.get("mark_iv")), "bid_iv": _number(payload.get("bid_iv")), "ask_iv": _number(payload.get("ask_iv")), "greeks": payload.get("greeks") or {}, "strike": product.capabilities.get("instrument", {}).get("strike"), "expiration": product.capabilities.get("instrument", {}).get("expiration_timestamp")}, None if quality == DataQuality.OK else "greeks_or_timestamp_missing")
+        observation = Observation(str(uuid4()), self.name, "deribit", product.product_id, "option", event_time, None, collected, collected, collected, None, quality, "2.0", {"instrument_name": product.venue_symbol, "underlying_price": _number(payload.get("underlying_price")), "mark_price": _number(payload.get("mark_price")), "mark_iv": _number(payload.get("mark_iv")), "bid_iv": _number(payload.get("bid_iv")), "ask_iv": _number(payload.get("ask_iv")), "greeks": payload.get("greeks") or {}, "strike": product.capabilities.get("instrument", {}).get("strike"), "option_type": product.capabilities.get("instrument", {}).get("option_type"), "expiration": product.capabilities.get("instrument", {}).get("expiration_timestamp")}, None if quality == DataQuality.OK else "greeks_or_timestamp_missing")
         return ProviderResult(self.name, data=[observation], request_count=1)
 
 

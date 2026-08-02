@@ -11,5 +11,6 @@ from .kis import KISProvider
 from .manager import MarketDataManager
 from .manual_news import ManualNewsProvider
 from .official_events import OfficialEventsProvider
+from .yfinance_delayed import YFinanceDelayedProvider
 
-__all__ = ["MarketDataProvider", "ProviderCapabilities", "ProviderResult", "BinancePublicProvider", "BybitPublicProvider", "CoinGlassProvider", "DeribitOptionsProvider", "GateCFDProvider", "GateFuturesProvider", "GateStockProvider", "ProviderHealth", "ProviderHealthRegistry", "KISProvider", "MarketDataManager", "ManualNewsProvider", "OfficialEventsProvider"]
+__all__ = ["MarketDataProvider", "ProviderCapabilities", "ProviderResult", "BinancePublicProvider", "BybitPublicProvider", "CoinGlassProvider", "DeribitOptionsProvider", "GateCFDProvider", "GateFuturesProvider", "GateStockProvider", "ProviderHealth", "ProviderHealthRegistry", "KISProvider", "MarketDataManager", "ManualNewsProvider", "OfficialEventsProvider", "YFinanceDelayedProvider"]

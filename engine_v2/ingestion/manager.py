@@ -23,7 +23,7 @@ class MarketDataManager:
 
     @staticmethod
     def _result_quality_ok(result: ProviderResult) -> bool:
-        return result.quality in {DataQuality.OK, DataQuality.PARTIAL}
+        return result.quality in {DataQuality.OK, DataQuality.PARTIAL, DataQuality.DELAYED}
 
     def _record_result(self, provider: str, result: ProviderResult, latency_ms: float) -> None:
         if self._result_quality_ok(result):
@@ -31,6 +31,7 @@ class MarketDataManager:
                 provider,
                 latency_ms=latency_ms,
                 notes=[result.reason] if result.reason else None,
+                quality=result.quality,
             )
         else:
             self.health_registry.error(

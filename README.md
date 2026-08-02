@@ -59,7 +59,7 @@ Binance/Bybit 시장 데이터 + provider-agnostic LLM 분석 + 거시경제 지
 ### 1. 저장소 클론
 
 ```bash
-git clone https://github.com/likegyu/bitcoin-trading-manager.git
+git clone https://github.com/toririn1/bitcoin-trading-manager.git
 cd bitcoin-trading-manager
 ```
 
@@ -240,6 +240,6 @@ V2 endpoints are additive under /api/v2/:
 - /api/v2/evaluation/summary
 - /api/v2/evaluation/calibration
 
-Fixture smoke mode works without provider credentials. Set V2_LIVE_ENABLED=true only when public/live provider access is intended. Product symbols for SOXL and SK Hynix are registered only from discovery; they are not guessed. V2 never creates, changes, cancels, or executes an order.
+V2 defaults to explicit live mode. Use V2_MODE=fixture only for the demo endpoint, or V2_MODE=replay for point-in-time storage replay; live never falls back to fixture. V2_LIVE_ENABLED=true is required for live collection. Fixture data is marked synthetic and cannot produce an actionable trade. Product symbols for SOXL and SK Hynix are registered only from discovery; they are not guessed. V2 never creates, changes, cancels, or executes an order.
 
 See CODEX_V2_SOURCE_AUDIT.md, CODEX_V2_SCHEMA.md, CODEX_V2_STATE.md, and CODEX_V2_REPORT.md.

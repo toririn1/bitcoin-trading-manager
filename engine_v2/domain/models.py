@@ -173,7 +173,7 @@ class Candle:
     volume: float | None
     quote_volume: float | None = None
     trade_count: int | None = None
-    is_final: bool = False
+    is_final: bool | None = False
     source: str = ""
     collected_at: datetime | None = None
     available_at: datetime | None = None
@@ -304,6 +304,11 @@ class OpportunityCandidate:
     invalidation: str | None
     targets: list[float] = field(default_factory=list)
     setup_quality: str = "unknown"
+    heuristic_setup_score: float | None = None
+    edge_quality: str = "uncalibrated"
+    cost_quality: str = "missing"
+    mode: str = "live"
+    session: str | None = None
     technical_score: float | None = None
     momentum_score: float | None = None
     orderflow_score: float | None = None

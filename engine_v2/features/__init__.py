@@ -1,4 +1,4 @@
-from .cross_asset import dynamic_relationship
+from .cross_asset import dynamic_relationship, insufficient_relationship
 from .derivatives import funding_basis, weighted_oi
 from .event_reaction import event_reaction
 from .factors import FACTOR_MEMBERS, factor_state, portfolio_concentration, product_factor_exposure

@@ -9,6 +9,8 @@ class DataQuality(str, Enum):
     PARTIAL = "partial"
     ESTIMATED = "estimated"
     TIMESTAMP_UNKNOWN = "timestamp_unknown"
+    DELAYED = "delayed"
+    PLAN_NOT_AVAILABLE = "plan_not_available"
     UNSUPPORTED = "unsupported"
     INVALID_SEMANTICS = "invalid_semantics"
     RATE_LIMITED = "rate_limited"
@@ -32,11 +34,13 @@ class AssetClass(str, Enum):
 class ProductType(str, Enum):
     SPOT = "spot"
     PERPETUAL = "perpetual"
+    OPTION = "option"
     FUTURE = "future"
     CFD = "cfd"
     EQUITY = "equity"
     ETF = "etf"
     INDEX = "index"
+    FX = "fx"
 
 
 class Direction(str, Enum):
@@ -95,6 +99,8 @@ def quality_penalty(value: DataQuality | str) -> int:
         DataQuality.ESTIMATED.value: -14,
         DataQuality.STALE.value: -18,
         DataQuality.TIMESTAMP_UNKNOWN.value: -22,
+        DataQuality.DELAYED.value: -16,
+        DataQuality.PLAN_NOT_AVAILABLE.value: -24,
         DataQuality.UNSUPPORTED.value: -30,
         DataQuality.INVALID_SEMANTICS.value: -30,
         DataQuality.RATE_LIMITED.value: -24,

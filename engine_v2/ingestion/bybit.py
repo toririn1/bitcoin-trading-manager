@@ -60,7 +60,9 @@ class BybitPublicProvider(MarketDataProvider):
             if not isinstance(row, list) or len(row) < 7:
                 continue
             open_time = _dt_ms(row[0])
-            close_time = _dt_ms((float(row[0]) / 1000) + _interval_seconds(timeframe))
+            open_ms = int(row[0])
+            close_ms = open_ms + _interval_seconds(timeframe) * 1000
+            close_time = _dt_ms(close_ms)
             candle = Candle(product.product_id, timeframe, open_time or now, close_time, _number(row[1]), _number(row[2]), _number(row[3]), _number(row[4]), _number(row[5]), _number(row[6]), None, bool(close_time and close_time <= now), self.name, now, now, DataQuality.OK if open_time else DataQuality.TIMESTAMP_UNKNOWN)
             result.data.append(Observation(str(uuid4()), self.name, "bybit_linear", product.product_id, f"candle_{timeframe}", open_time, None, now, now, now, None, candle.quality, "2.0", candle.to_dict(), None if open_time else "kline_time_missing"))
         trades = (await self.client.get(BYBIT_API + "/v5/market/recent-trade", {"category": "linear", "symbol": product.venue_symbol, "limit": min(limit, 1000)})).payload

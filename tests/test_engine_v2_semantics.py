@@ -94,3 +94,147 @@ def test_fixture_engine_produces_no_trade_candidate_without_llm():
         assert snapshot["explanation"]["summary"]
         assert snapshot["critic"]["can_change_deterministic_values"] is False
     asyncio.run(run())
+
+
+def test_bybit_close_time_uses_milliseconds_and_marks_forming_candle():
+    from engine_v2.domain.models import ProductSpec, parse_datetime
+    from engine_v2.domain.enums import ProductType
+    from engine_v2.ingestion.http import JSONResponse
+    from engine_v2.ingestion.bybit import BybitPublicProvider
+    from datetime import timedelta
+
+    class FakeClient:
+        async def get(self, url, params=None, headers=None):
+            if url.endswith("/kline"):
+                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                old_ms = int(datetime(2026, 8, 1, tzinfo=timezone.utc).timestamp() * 1000)
+                return JSONResponse({"result": {"list": [
+                    [str(now_ms - 60_000), "1", "1", "1", "1", "1", "1"],
+                    [str(old_ms), "1", "1", "1", "1", "1", "1"],
+                ]}}, 200, {}, 0)
+            if url.endswith("/recent-trade"):
+                return JSONResponse({"result": {"list": []}}, 200, {}, 0)
+            return JSONResponse({"result": {"list": []}}, 200, {}, 0)
+
+    product = ProductSpec("BTC_BYBIT_PERP", "BTC", "bybit", "bybit_linear", "BTCUSDT", ProductType.PERPETUAL, is_tradable=True)
+    result = asyncio.run(BybitPublicProvider(client=FakeClient()).backfill(product, timeframe="15m", limit=2))
+    candles = [item.payload for item in result.data if item.data_type == "candle_15m"]
+    assert len(candles) == 2
+    for candle in candles:
+        assert candle["close_time"] is not None
+        assert (parse_datetime(candle["close_time"]) - parse_datetime(candle["open_time"])).total_seconds() == 900
+    assert any(candle["is_final"] is False for candle in candles)
+    assert any(candle["is_final"] is True for candle in candles)
+
+
+def test_orderbook_uses_best_bid_and_best_ask_and_rejects_crossed_book():
+    from engine_v2.features.microstructure import orderbook_features
+
+    valid = orderbook_features({"bids": [["99", "2"], ["100", "1"]], "asks": [["102", "1"], ["101", "2"]]})
+    assert valid["best_bid"] == 100
+    assert valid["best_ask"] == 101
+    assert valid["best_bid"] < valid["mid_price"] < valid["best_ask"]
+    assert valid["spread_bps"] >= 0
+    crossed = orderbook_features({"bids": [["101", "1"]], "asks": [["100", "1"]]})
+    assert crossed["quality"] == "invalid_semantics"
+    assert crossed["reason"] == "crossed_book"
+
+
+def test_trade_cvd_sorts_deduplicates_and_separates_notional():
+    result = trade_cvd([
+        {"product_id": "BTC_BINANCE_PERP", "venue": "binance", "trade_id": "2", "price": 110, "quantity": 1, "aggressor_side": "buy", "event_time": "2026-08-02T00:02:00Z"},
+        {"product_id": "BTC_BINANCE_PERP", "venue": "binance", "trade_id": "1", "price": 100, "quantity": 2, "aggressor_side": "sell", "event_time": "2026-08-02T00:01:00Z"},
+        {"product_id": "BTC_BINANCE_PERP", "venue": "binance", "trade_id": "1", "price": 100, "quantity": 2, "aggressor_side": "sell", "event_time": "2026-08-02T00:01:00Z"},
+    ])
+    assert result["duplicate_count"] == 1
+    assert result["out_of_order_count"] == 1
+    assert result["quantity_cvd"] == -1
+    assert result["notional_cvd_usd"] == -90
+    assert result["notional_cvd_ratio"] < 0
+
+
+def test_deribit_options_use_option_product_type():
+    from engine_v2.domain.enums import ProductType
+    from engine_v2.ingestion.deribit import DeribitOptionsProvider
+
+    assert ProductType.OPTION.value == "option"
+    assert "option_instruments" in DeribitOptionsProvider().capabilities.capabilities
+
+
+def test_duckdb_and_parquet_are_real_write_backends(tmp_path):
+    from pathlib import Path
+    from engine_v2.storage.database import V2Storage
+
+    store = V2Storage(tmp_path / "db", tmp_path / "engine.duckdb", tmp_path / "raw")
+    rows = fixture_observations(count=2)
+    assert store.backend == "duckdb"
+    assert store.append_observations(rows) == len(rows)
+    assert store.append_observations(rows) == 0
+    assert len(list(Path(tmp_path / "raw").rglob("*.parquet"))) == len(rows)
+    assert store.observations(limit=100)
+    store.close()
+
+
+def test_gate_candle_final_semantics():
+    from engine_v2.domain.enums import ProductType
+    from engine_v2.domain.models import ProductSpec
+    from engine_v2.ingestion.gate_futures import GateFuturesProvider
+    from engine_v2.ingestion.http import JSONResponse
+
+    class FakeClient:
+        async def get(self, url, params=None, headers=None):
+            now = int(datetime.now(timezone.utc).timestamp())
+            return JSONResponse([
+                {"t": now - 60, "o": "1", "h": "1", "l": "1", "c": "1", "v": "1", "sum": "1"},
+                {"t": 1_700_000_000, "o": "1", "h": "1", "l": "1", "c": "1", "v": "1", "sum": "1"},
+            ], 200, {}, 0)
+
+    product = ProductSpec("BTC_GATE_PERP", "BTC", "gate_futures", "gate_usdt_futures", "BTC_USDT", ProductType.PERPETUAL, is_tradable=True)
+    result = asyncio.run(GateFuturesProvider(client=FakeClient()).backfill(product, timeframe="15m", limit=2))
+    candles = [row.payload for row in result.data]
+    assert any(row["is_final"] is False for row in candles)
+    assert any(row["is_final"] is True for row in candles)
+    assert all(row["close_time"] is not None for row in candles)
+
+
+def test_yfinance_catalog_is_delayed_and_explicit(monkeypatch):
+    from engine_v2.ingestion import yfinance_delayed as module
+    from engine_v2.domain.enums import DataQuality
+    from engine_v2.domain.models import ProductSpec
+
+    monkeypatch.setattr(module, "_history", lambda *args, **kwargs: [{
+        "timestamp": datetime(2026, 8, 1, 13, 30, tzinfo=timezone.utc),
+        "open": 100.0,
+        "high": 101.0,
+        "low": 99.0,
+        "close": 100.5,
+        "volume": 10.0,
+    }])
+    provider = module.YFinanceDelayedProvider()
+    products_result = asyncio.run(provider.discover_products(["QQQ", "SK_HYNIX_KRX"]))
+    products = products_result.products
+    assert {product.venue_symbol for product in products} == {"QQQ", "000660.KS"}
+    assert all(product.capabilities["delay_label"] == "delayed" for product in products)
+    result = asyncio.run(provider.backfill(products[0], timeframe="15m", limit=1))
+    assert result.quality == DataQuality.DELAYED
+    assert result.data[0].quality == DataQuality.DELAYED
+    assert result.data[0].payload["is_final"] is True
+
+
+def test_replay_candidate_records_trigger_fill_exit_and_costs():
+    from engine_v2.evaluation import ReplayConfig, replay_candidate
+
+    candles = [
+        {"open_time": "2026-01-01T00:00:00Z", "open": 100, "high": 101, "low": 99, "close": 100},
+        {"open_time": "2026-01-01T00:15:00Z", "open": 100, "high": 103, "low": 99, "close": 102},
+    ]
+    result = replay_candidate(
+        {"product_id": "BTC", "direction": "long", "entry_plan": "conditional_trigger", "trigger_price": 100, "stop_price": 98, "target_price": 102},
+        candles,
+        config=ReplayConfig(fee_bps=2, slippage_bps=1),
+    )
+    assert result["status"] == "filled"
+    assert result["exit_reason"] == "target"
+    assert result["mfe_bps"] > 0
+    assert result["mae_bps"] < 0
+    assert result["net_return_bps"] < result["gross_return_bps"]

@@ -75,3 +75,22 @@ def _residual_z(x, y):
 
 def _insufficient(count, reason):
     return {"rolling_corr_20": None, "rolling_corr_60": None, "rolling_corr_120": None, "ew_corr": None, "rolling_beta": None, "lead_lag_best_bars": None, "lead_lag_score": None, "residual_zscore": None, "relationship_stability": 0.0, "sample_count": count, "session_overlap_ratio": 0.0, "usable": False, "state": "insufficient_data", "reason": reason}
+
+
+def insufficient_relationship(count: int, reason: str) -> dict[str, Any]:
+    return {
+        "rolling_corr_20": None,
+        "rolling_corr_60": None,
+        "rolling_corr_120": None,
+        "ew_corr": None,
+        "rolling_beta": None,
+        "lead_lag_best_bars": None,
+        "lead_lag_score": None,
+        "residual_zscore": None,
+        "relationship_stability": 0.0,
+        "sample_count": count,
+        "session_overlap_ratio": 0.0,
+        "usable": False,
+        "state": "insufficient_data",
+        "reason": reason,
+    }

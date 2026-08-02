@@ -44,13 +44,13 @@ class ProviderHealthRegistry:
     def get(self, provider: str) -> ProviderHealth:
         return self._items.setdefault(provider, ProviderHealth(provider))
 
-    def success(self, provider: str, *, latency_ms: float | None = None, notes: list[str] | None = None) -> None:
+    def success(self, provider: str, *, latency_ms: float | None = None, notes: list[str] | None = None, quality: DataQuality = DataQuality.OK) -> None:
         item = self.get(provider)
         item.last_success_at = datetime.now(timezone.utc)
         item.last_latency_ms = latency_ms
         item.consecutive_failures = 0
         item.circuit_state = "closed"
-        item.quality = DataQuality.OK
+        item.quality = quality
         if notes:
             item.notes = notes[-10:]
 

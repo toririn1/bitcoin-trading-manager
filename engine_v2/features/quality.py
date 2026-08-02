@@ -33,6 +33,6 @@ def candidate_gate(quality: dict[str, Any], *, minimum_score: int = 55) -> tuple
     reasons = []
     if int(quality.get("score") or 0) < minimum_score:
         reasons.append("data_quality_gate")
-    if quality.get("quality") in {"invalid_semantics", "validation_error", "unsupported"}:
+    if quality.get("quality") in {"invalid_semantics", "validation_error", "unsupported", "plan_not_available", "authentication_required"}:
         reasons.append("invalid_data_semantics")
     return not reasons, reasons
