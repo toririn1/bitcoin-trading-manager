@@ -10,6 +10,7 @@ import concurrent.futures
 import contextlib
 import functools
 import json
+import logging
 import math
 import os
 import time
@@ -42,6 +43,7 @@ from analyzer import run_full_analysis
 from macro_fetcher import fetch_macro_context
 from time_utils import format_kst, now_kst
 from engine_v2.api.routes import register_v2_routes
+from engine_v2.engine import V2Engine
 
 # ── Reflection / Memory (optional: rank_bm25 미설치 시 None) ──
 try:
@@ -94,7 +96,8 @@ FIB_COLORS = {
 }
 
 app = FastAPI()
-register_v2_routes(app, os.path.dirname(os.path.abspath(__file__)))
+_server_logger = logging.getLogger(__name__)
+register_v2_routes(app)
 # 분석(LLM API) + 데이터 fetch가 동시에 실행될 수 있도록 워커 수 충분히 확보
 # 기본 4개는 분석 1건만으로 전부 포화 → CPU 코어 × 4 또는 최소 16
 _executor = concurrent.futures.ThreadPoolExecutor(
@@ -1655,22 +1658,62 @@ async def _reflection_loop():
         await asyncio.sleep(INTERVAL)
 
 
+async def _stop_component(name: str, stop_callable) -> None:
+    try:
+        await stop_callable()
+    except Exception:
+        _server_logger.exception("%s shutdown failed", name)
+
+
 @app.on_event("startup")
 async def on_startup():
-    await _market_stream.start()
-    await _account_stream.start()
-    await _macro_snapshot.start()
-    await _schedule_manager.start()
-    asyncio.create_task(_reflection_loop(), name="reflection-loop")
+    app.state.v2_engine = V2Engine(
+        root_dir=os.path.dirname(os.path.abspath(__file__))
+    )
+    try:
+        await _market_stream.start()
+        await _account_stream.start()
+        await _macro_snapshot.start()
+        await _schedule_manager.start()
+        app.state.reflection_task = asyncio.create_task(
+            _reflection_loop(), name="reflection-loop"
+        )
+    except BaseException:
+        engine = getattr(app.state, "v2_engine", None)
+        try:
+            if engine is not None:
+                engine.close()
+        finally:
+            app.state.v2_engine = None
+        raise
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    await _market_stream.stop()
-    await _account_stream.stop()
-    await _macro_snapshot.stop()
-    await _analysis_manager.stop()
-    await _schedule_manager.stop()
+    await _stop_component("market stream", _market_stream.stop)
+    await _stop_component("account stream", _account_stream.stop)
+    await _stop_component("macro snapshot", _macro_snapshot.stop)
+    await _stop_component("analysis manager", _analysis_manager.stop)
+    await _stop_component("schedule manager", _schedule_manager.stop)
+
+    reflection_task = getattr(app.state, "reflection_task", None)
+    if reflection_task is not None:
+        reflection_task.cancel()
+        try:
+            await reflection_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            _server_logger.exception("reflection loop shutdown failed")
+        finally:
+            app.state.reflection_task = None
+
+    engine = getattr(app.state, "v2_engine", None)
+    try:
+        if engine is not None:
+            engine.close()
+    finally:
+        app.state.v2_engine = None
 
 
 @app.get("/api/market-stream")

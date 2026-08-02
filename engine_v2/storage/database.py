@@ -510,8 +510,11 @@ class V2Storage:
         }
 
     def close(self) -> None:
-        if self._db is not None:
-            self._db.close()
+        db = self._db
+        self._db = None
+        self._sqlite = None
+        if db is not None:
+            db.close()
 
 
 def _flat_record(record: dict[str, Any]) -> dict[str, Any]:

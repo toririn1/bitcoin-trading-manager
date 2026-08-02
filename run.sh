@@ -41,4 +41,14 @@ if [ ! -f ".env" ]; then
   echo ""
 fi
 
-.venv/bin/python -m uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+UVICORN_ARGS=(
+  server:app
+  --host 0.0.0.0
+  --port 8000
+)
+
+if [[ "${UVICORN_RELOAD:-false}" =~ ^(1|true|yes)$ ]]; then
+  UVICORN_ARGS+=(--reload)
+fi
+
+exec .venv/bin/python -m uvicorn "${UVICORN_ARGS[@]}"

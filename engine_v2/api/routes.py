@@ -29,13 +29,17 @@ class ManualEventRequest(BaseModel):
     notes: str | None = None
 
 
-def register_v2_routes(app: FastAPI, root_dir: str | Path | None = None) -> V2Engine:
-    engine = V2Engine(root_dir=root_dir or Path.cwd())
-    app.state.v2_engine = engine
+def register_v2_routes(app: FastAPI, root_dir: str | Path | None = None) -> APIRouter:
+    # root_dir remains a compatibility parameter; route registration is pure.
+    # Engine/storage/provider lifecycle belongs to FastAPI startup/shutdown.
+    del root_dir
     router = APIRouter(prefix="/api/v2", tags=["v2"])
 
     def get_engine(request: Request) -> V2Engine:
-        return request.app.state.v2_engine
+        engine = getattr(request.app.state, "v2_engine", None)
+        if engine is None:
+            raise HTTPException(status_code=503, detail="V2 engine is not initialized")
+        return engine
 
     @router.get("/universe")
     async def universe(request: Request):
@@ -135,4 +139,4 @@ def register_v2_routes(app: FastAPI, root_dir: str | Path | None = None) -> V2En
         return envelope(get_engine(request).status())
 
     app.include_router(router)
-    return engine
+    return router

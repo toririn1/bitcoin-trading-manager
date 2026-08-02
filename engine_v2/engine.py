@@ -79,6 +79,10 @@ class V2Engine:
         self.last_snapshot: dict[str, Any] | None = None
         self.last_decision: dict[str, Any] | None = None
 
+    def close(self) -> None:
+        """Release the storage connection owned by this engine."""
+        self.storage.close()
+
     def status(self) -> dict[str, Any]:
         return {
             "engine": "v2",

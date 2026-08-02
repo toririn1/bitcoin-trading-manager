@@ -13,6 +13,7 @@ codex/v2-decision-loop, normal ancestry from the existing V2 implementation comm
 - Candidate entry plans are deterministic and replayable.
 - Candidate ranking is global across products, and decision selection shares that ranking instead of depending on registry order.
 - Equal ranking scores use ascending product_id, direction, and setup_type; random candidate IDs are not used.
+- FastAPI imports and route registration do not open V2 storage. The engine is created on startup, closed on shutdown, and V2 routes return 503 before initialization. run.sh reload is opt-in.
 - Shadow outcomes are stored only for eligible, deduplicated open candidates. A not-triggered candidate stays open until expiry; the calibration endpoint reports insufficient_sample until enough terminal outcomes exist.
 - Cross-asset relationships are session-aware and timestamp-tolerant.
 - Parquet is batch/atomic; database hashes prevent duplicate restart writes.
@@ -26,4 +27,4 @@ codex/v2-decision-loop, normal ancestry from the existing V2 implementation comm
 - Shadow expiry, deduplication, outcome, and insufficient-sample smoke
 - Provider capability and cross-asset alignment smoke
 
-Final regression: .venv/bin/python -m pytest -q -> 135 passed, 5 warnings, 5 subtests passed, including global product-order and equal-score tie-break regressions. Live shadow one-shot: data_unavailable=false, final_action=no_trade, execution_permission=no_trade, settled_outcomes=0, open_shadow_candidates=0.
+Final regression: .venv/bin/python -m pytest -q -> 142 passed, 5 warnings, 5 subtests passed; compileall . passed; run.sh basic and reload smoke both returned 200 for /health and /api/v2/status without DuckDB lock traceback. Live shadow one-shot: data_unavailable=false, final_action=no_trade, execution_permission=no_trade, settled_outcomes=0, open_shadow_candidates=0.
