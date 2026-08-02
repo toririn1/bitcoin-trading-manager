@@ -39,7 +39,7 @@ from engine_v2.ingestion import (
     YFinanceDelayedProvider,
 )
 from engine_v2.intelligence import build_snapshot, explain_snapshot, validate_claims
-from engine_v2.opportunities import scan_opportunities
+from engine_v2.opportunities import rank_candidates, scan_opportunities
 from engine_v2.storage import V2Storage
 
 from .cross_asset_refs import build_relationships
@@ -296,7 +296,9 @@ class V2Engine:
                 "snapshot_id": None,
             }
             candidates.extend(scan_opportunities([product], base, min_net_edge_bps=self.settings.min_net_edge_bps))
-        candidate_dicts = [candidate.to_dict() for candidate in candidates]
+        candidate_dicts = rank_candidates(
+            [candidate.to_dict() for candidate in candidates]
+        )
 
         snapshot = build_snapshot(
             registry=self.registry.to_dict(),
@@ -464,17 +466,17 @@ class V2Engine:
         }
 
     def _decision_from_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any]:
-        candidates = snapshot.get("ranked_candidates", [])
+        candidates = rank_candidates(snapshot.get("ranked_candidates", []))
         directional = [
             item for item in candidates
             if item.get("direction") in {"long", "short"}
             and (item.get("valid_for_shadow") or item.get("valid_for_user_execution"))
         ]
-        top = directional[0] if directional else None
-        no_trade = next(
-            (item for item in candidates if item.get("direction") == "no_trade"),
-            None,
-        )
+        top = rank_candidates(directional)[0] if directional else None
+        no_trade_candidates = [
+            item for item in candidates if item.get("direction") == "no_trade"
+        ]
+        no_trade = rank_candidates(no_trade_candidates)[0] if no_trade_candidates else None
         selected = top or no_trade
         if snapshot.get("data_unavailable"):
             final_action = "data_unavailable"

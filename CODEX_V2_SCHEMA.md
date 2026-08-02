@@ -36,6 +36,7 @@ Observation timestamps are UTC and preserve source event/publish/availability ti
 ## Snapshot and decision
 
 The snapshot contains facts, computed_features, data_quality, factor_state, event_state, ranked_candidates, portfolio_constraints, and unsupported_data.
+ranked_candidates is globally ordered across every tradable product. The final decision uses the same ranking key rather than trusting the first valid directional row.
 
 Decision final_action is:
 actionable_long, actionable_short, research_only_long, research_only_short, no_trade, or data_unavailable.

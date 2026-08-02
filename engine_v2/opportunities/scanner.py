@@ -19,13 +19,43 @@ def scan_opportunities(products: Iterable[dict[str, Any]], snapshot: dict[str, A
         directions.append(Direction.NO_TRADE)
         for direction in directions:
             candidates.append(score_candidate(product, direction, snapshot, min_net_edge_bps=min_net_edge_bps))
-    return sorted(
-        candidates,
-        key=lambda item: (
-            item.valid_for_user_execution,
-            item.valid_for_shadow,
-            item.net_edge_bps if item.net_edge_bps is not None else -10_000,
-            item.confidence or 0,
-        ),
-        reverse=True,
-    )
+    return rank_candidates(candidates)
+
+
+def rank_candidates(
+    candidates: Iterable[OpportunityCandidate | dict[str, Any]],
+) -> list[OpportunityCandidate | dict[str, Any]]:
+    """Apply one deterministic ranking to candidates from every product."""
+    return sorted(candidates, key=candidate_rank_key, reverse=True)
+
+
+def candidate_rank_key(
+    candidate: OpportunityCandidate | dict[str, Any],
+) -> tuple[int, int, float, float, float]:
+    """Rank execution eligibility, shadow eligibility, edge, confidence, then setup score."""
+    valid_for_user = _flag(_candidate_value(candidate, "valid_for_user_execution"))
+    valid_for_shadow = _flag(_candidate_value(candidate, "valid_for_shadow"))
+    net_edge = _number(_candidate_value(candidate, "net_edge_bps"), default=-10_000.0)
+    confidence = _number(_candidate_value(candidate, "confidence"), default=-10_000.0)
+    heuristic = _number(_candidate_value(candidate, "heuristic_setup_score"), default=-10_000.0)
+    return (valid_for_user, valid_for_shadow, net_edge, confidence, heuristic)
+
+
+def _candidate_value(candidate: OpportunityCandidate | dict[str, Any], name: str) -> Any:
+    if isinstance(candidate, dict):
+        return candidate.get(name)
+    return getattr(candidate, name, None)
+
+
+def _flag(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    return int(str(value).lower() in {"1", "true", "yes"})
+
+
+def _number(value: Any, *, default: float) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if result == result else default

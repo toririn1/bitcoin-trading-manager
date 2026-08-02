@@ -10,7 +10,7 @@ from engine_v2.domain.registry import build_default_registry
 from engine_v2.features.cross_asset import dynamic_relationship
 from engine_v2.ingestion.yfinance_delayed import YFinanceDelayedProvider
 from engine_v2.ingestion.official_events import OfficialEventsProvider, _economic_observation
-from engine_v2.opportunities.scanner import scan_opportunities
+from engine_v2.opportunities.scanner import rank_candidates, scan_opportunities
 from engine_v2.opportunities.scorer import score_candidate
 from engine_v2.opportunities.product_guards import evaluate_product_guard
 from engine_v2.shadow_runner import ShadowRunner
@@ -36,6 +36,61 @@ def test_reference_products_and_spot_short_are_excluded(monkeypatch):
     }
     candidates = scan_opportunities([spot], snapshot)
     assert {item.direction.value for item in candidates} == {"long", "no_trade"}
+
+
+def test_global_candidate_ranking_is_independent_of_product_order(tmp_path, monkeypatch):
+    early_product = {
+        "product_id": "EARLY_PRODUCT",
+        "direction": "long",
+        "valid_for_shadow": True,
+        "valid_for_user_execution": False,
+        "net_edge_bps": 10,
+        "confidence": 0.9,
+        "heuristic_setup_score": 5,
+        "candidate_status": "research_only_long",
+        "execution_permission": "shadow_only",
+        "setup_quality": "research",
+    }
+    later_product = {
+        "product_id": "LATER_PRODUCT",
+        "direction": "short",
+        "valid_for_shadow": True,
+        "valid_for_user_execution": False,
+        "net_edge_bps": 20,
+        "confidence": 0.6,
+        "heuristic_setup_score": 4,
+        "candidate_status": "research_only_short",
+        "execution_permission": "shadow_only",
+        "setup_quality": "research",
+    }
+    assert [item["product_id"] for item in rank_candidates([early_product, later_product])] == [
+        "LATER_PRODUCT",
+        "EARLY_PRODUCT",
+    ]
+
+    monkeypatch.setenv("V2_STORAGE_BACKEND", "sqlite")
+    settings = V2Settings(mode="fixture", live_enabled=False, duckdb_path="data/x.duckdb", parquet_root="data/raw")
+    engine = V2Engine(tmp_path, settings)
+    snapshot = {
+        "mode": "fixture",
+        "data_unavailable": False,
+        "ranked_candidates": [early_product, later_product, {
+            "product_id": "NO_TRADE_PRODUCT",
+            "direction": "no_trade",
+            "valid_for_shadow": False,
+            "valid_for_user_execution": False,
+            "candidate_status": "no_trade",
+            "execution_permission": "no_trade",
+            "setup_quality": "no_trade",
+        }],
+        "account_overlay": {},
+        "data_quality": {"score": 100},
+        "computed_features": {"regime": {}},
+        "portfolio_constraints": {},
+    }
+    decision = engine._decision_from_snapshot(snapshot)
+    assert decision["final_action"] == "research_only_short"
+    assert decision["candidate_rank"][0]["product_id"] == "LATER_PRODUCT"
 
 
 def test_fixture_weak_directional_candidates_cannot_enter_shadow(tmp_path, monkeypatch):
