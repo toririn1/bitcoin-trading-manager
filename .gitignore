@@ -41,3 +41,5 @@ artifacts/technical-strategy-review-v2/
 artifacts/technical-strategy-review-v2.tar.gz
 artifacts/technical-review/
 artifacts/technical-review.tar.gz
+artifacts/pre_v2_untracked_files.txt
+artifacts/pre_v2_worktree.patch
