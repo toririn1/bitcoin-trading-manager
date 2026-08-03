@@ -92,10 +92,43 @@ def register_v2_routes(app: FastAPI, root_dir: str | Path | None = None) -> APIR
         return get_engine(request).data_health()
 
     @router.get("/snapshot")
-    async def snapshot(request: Request, mode: str | None = None, live: bool | None = None):
+    async def snapshot(
+        request: Request,
+        mode: str | None = None,
+        live: bool | None = None,
+        include_raw: bool = False,
+    ):
         engine = get_engine(request)
-        data = await engine.build_snapshot(mode=mode, live=live)
+        data = await engine.build_snapshot(mode=mode, live=live, include_raw=include_raw)
         return envelope(data, generated_at=data.get("generated_at"))
+
+    @router.get("/raw")
+    async def raw_observations(
+        request: Request,
+        product_id: str | None = None,
+        data_type: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ):
+        engine = get_engine(request)
+        safe_offset = max(0, int(offset))
+        safe_limit = min(max(1, int(limit)), 500)
+        rows = engine.storage.observations(
+            product_id=product_id,
+            data_type=data_type,
+            limit=safe_offset + safe_limit,
+        )
+        page = rows[safe_offset:safe_offset + safe_limit]
+        return envelope(
+            page,
+            meta={
+                "offset": safe_offset,
+                "limit": safe_limit,
+                "returned": len(page),
+                "has_more": len(rows) > safe_offset + safe_limit,
+                "raw": True,
+            },
+        )
 
     @router.get("/demo/snapshot")
     async def demo_snapshot(request: Request):
@@ -145,10 +178,7 @@ def register_v2_routes(app: FastAPI, root_dir: str | Path | None = None) -> APIR
     async def history_readiness(request: Request):
         engine = get_engine(request)
         limits = dict(engine.settings.history_limits)
-        products = [
-            product for product in engine.registry.products.values()
-            if product.role == "tradable" or product.provider == "yfinance_delayed"
-        ]
+        products = engine._selected_live_products()
         return envelope(engine.storage.history_summary(products, limits, minimum_closed=engine.settings.minimum_sample_count))
 
     @router.get("/horizons")
@@ -164,6 +194,7 @@ def register_v2_routes(app: FastAPI, root_dir: str | Path | None = None) -> APIR
                 "product_id": product_id,
                 "underlying_id": (state.get("product") or {}).get("underlying_id"),
                 "analysis_readiness": state.get("analysis_readiness", False),
+                "readiness": state.get("readiness", {}),
                 "horizons": state.get("features", {}).get("horizons", {}),
             })
         return envelope(rows, generated_at=snapshot.get("generated_at"))
@@ -187,9 +218,11 @@ def register_v2_routes(app: FastAPI, root_dir: str | Path | None = None) -> APIR
             and item.get("candidate_stage", "diagnostic_candidate") != "diagnostic_candidate"
             and item.get("analysis_readiness", True)
         ]
+        stage_counts = snapshot.get("candidate_counts") or {}
         meta = {
             "mode": snapshot.get("mode"),
             "current_candidate_count": len(current),
+            "candidate_counts": stage_counts,
             "stale_candidate_count": snapshot.get("stale_candidate_count", 0),
             "stale_candidate_snapshot_id": snapshot.get("stale_candidate_snapshot_id"),
             "stale_candidate_generated_at": snapshot.get("stale_candidate_generated_at"),

@@ -7,7 +7,7 @@ from engine_v2.domain.enums import DataQuality
 from engine_v2.domain.models import Candle, Observation, TradeExecutionActual
 
 
-def fixture_observations(product_id: str = "BTC_BINANCE_PERP", *, count: int = 80) -> list[Observation]:
+def fixture_observations(product_id: str = "BTC_BINANCE_BTCUSDT_PERP", *, count: int = 80) -> list[Observation]:
     """Deterministic fixture used by tests and no-key smoke mode, not live fallback data."""
     now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     result: list[Observation] = []

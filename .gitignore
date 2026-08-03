@@ -35,3 +35,9 @@ btc-dashboard/node_modules/
 
 # 로컬 데이터
 data/
+artifacts/technical-strategy-review/
+artifacts/technical-strategy-review.tar.gz
+artifacts/technical-strategy-review-v2/
+artifacts/technical-strategy-review-v2.tar.gz
+artifacts/technical-review/
+artifacts/technical-review.tar.gz

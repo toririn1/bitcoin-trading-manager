@@ -49,7 +49,7 @@ class GateFuturesProvider(MarketDataProvider):
             item = item if isinstance(item, dict) else {}
             contract_type, expiry = classify_contract(item, product_type=ProductType.PERPETUAL)
             product_type = ProductType.FUTURE if contract_type == "dated_future" else ProductType.PERPETUAL
-            product_id = canonical_product_id(base, "GATE", contract_type, expiry)
+            product_id = canonical_product_id(base, "GATE", contract_type, expiry, venue_symbol=contract)
             tradable = contract_type in {"perpetual", "dated_future"}
             products.append(ProductSpec(product_id, base, self.name, f"gate_{self.settle}_futures", contract, product_type, quote_currency=self.settle.upper(), settlement_currency=self.settle.upper(), contract_size=_number(item.get("quanto_multiplier")), tick_size=_number(item.get("order_price_round")), min_order_size=_number(item.get("order_size_min")), max_leverage=_number(item.get("leverage_max")), funding_supported=contract_type == "perpetual", short_supported=tradable, price_source="gate_futures_public", is_tradable=tradable, role="tradable" if tradable else "reference", capabilities={"contract": item}, discovered_at=datetime.now(timezone.utc), contract_type=contract_type, expiry=expiry, delivery_time=expiry, settlement_asset=self.settle.upper(), underlying_reference=base, discovery_payload_hash=payload_hash(item)))
         return ProviderResult(self.name, products=products, request_count=1)

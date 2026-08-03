@@ -96,7 +96,7 @@ class BinancePublicProvider(MarketDataProvider):
             price_filter = filters.get("PRICE_FILTER", {})
             lot_filter = filters.get("LOT_SIZE", {})
             products.append(ProductSpec(
-                product_id=canonical_product_id(base, "BINANCE", contract_type),
+                product_id=canonical_product_id(base, "BINANCE", contract_type, venue_symbol=symbol),
                 underlying_id=underlying,
                 provider=self.name,
                 venue=self.capabilities.venue,

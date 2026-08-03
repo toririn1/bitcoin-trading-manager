@@ -119,7 +119,7 @@ def test_binance_discovery_rejects_tradifi_rows_and_preserves_product_metadata()
     )
     assert len(result.products) == 1
     product = result.products[0]
-    assert product.product_id == "BTC_BINANCE_PERP"
+    assert product.product_id == "BTC_BINANCE_BTCUSDT_PERP"
     assert product.product_type == ProductType.PERPETUAL
     assert {
         product.role,

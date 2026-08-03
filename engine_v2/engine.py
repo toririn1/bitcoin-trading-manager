@@ -106,6 +106,38 @@ class V2Engine:
             },
         }
 
+    def _selected_live_products(self) -> list[Any]:
+        selected_underlyings = {
+            item.strip().upper()
+            for item in os.getenv(
+                "V2_HISTORY_UNDERLYINGS",
+                "BTC,QQQ,SOXX,SOXL,NVDA,MU,SK_HYNIX_KRX,USD_KRW",
+            ).split(",")
+            if item.strip()
+        }
+        configured_symbols = {
+            item.strip().upper()
+            for item in os.getenv(
+                "V2_LIVE_PRODUCT_SYMBOLS",
+                "BTCUSDT,BTC_USDT,ETHUSDT,ETH_USDT",
+            ).split(",")
+            if item.strip()
+        }
+        output = []
+        for product in self.registry.products.values():
+            if product.underlying_id.upper() not in selected_underlyings:
+                continue
+            if product.provider == "yfinance_delayed":
+                output.append(product)
+                continue
+            if (
+                product.role == "tradable"
+                and product.is_tradable
+                and product.venue_symbol.upper() in configured_symbols
+            ):
+                output.append(product)
+        return output
+
     async def discover(self) -> dict[str, Any]:
         results = await self.manager.discover(TARGET_UNDERLYINGS)
         return {
@@ -120,6 +152,7 @@ class V2Engine:
         mode: str | None = None,
         live: bool | None = None,
         decision_time: datetime | None = None,
+        include_raw: bool = False,
     ) -> dict[str, Any]:
         selected_mode = self._resolve_mode(mode, live)
         decision_time = decision_time or datetime.now(timezone.utc)
@@ -141,7 +174,7 @@ class V2Engine:
             "positions": None,
             "reason": "non_live_mode",
         }
-        return self._assemble_snapshot(records, selected_mode, decision_time, account)
+        return self._assemble_snapshot(records, selected_mode, decision_time, account, include_raw=include_raw)
 
     def _resolve_mode(self, mode: str | None, live: bool | None) -> str:
         if live is not None:
@@ -167,16 +200,7 @@ class V2Engine:
             ).split(",")
             if item.strip()
         }
-        products = [
-            product for product in self.registry.products.values()
-            if (
-                product.underlying_id.upper() in selected_underlyings
-                and (
-                    product.role == "tradable"
-                    or product.provider == "yfinance_delayed"
-                )
-            )
-        ]
+        products = self._selected_live_products()
         timeframes = [timeframe for timeframe in self.settings.default_timeframes if timeframe in limits]
         tasks = [
             self.manager.backfill_history(
@@ -191,7 +215,17 @@ class V2Engine:
         results = await asyncio.gather(*tasks) if tasks else []
         observations = [observation for result in results for observation in result.data]
         if os.getenv("COINGLASS_ENABLED", "").lower() in {"1", "true", "yes"} and os.getenv("COINGLASS_API_KEY"):
-            btc = self.registry.product("BTC_BINANCE_PERP")
+            btc = next(
+                (
+                    product for product in self.registry.products.values()
+                    if product.underlying_id == "BTC"
+                    and product.provider == "binance"
+                    and product.role == "tradable"
+                    and product.is_tradable
+                    and product.product_type.value == "perpetual"
+                ),
+                None,
+            )
             provider = self.manager.providers.get("coinglass")
             if btc is not None and provider is not None:
                 result = await provider.backfill(btc, timeframe="15m", limit=limits.get("15m", 300))
@@ -243,11 +277,7 @@ class V2Engine:
         }
         limits = dict(self.settings.history_limits)
         output: list[dict[str, Any]] = []
-        for product in self.registry.products.values():
-            if product.underlying_id.upper() not in selected_underlyings:
-                continue
-            if product.role != "tradable" and product.provider != "yfinance_delayed":
-                continue
+        for product in self._selected_live_products():
             for timeframe in self.settings.default_timeframes:
                 requested = limits.get(timeframe, 300)
                 for payload in self.storage.candle_history(
@@ -284,22 +314,38 @@ class V2Engine:
         mode: str,
         decision_time: datetime,
         account: dict[str, Any],
+        *,
+        include_raw: bool = False,
     ) -> dict[str, Any]:
         previous_snapshot = self.last_snapshot
         data_unavailable = not bool(records) and mode in {"live", "replay"}
         by_product: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for record in records:
             by_product[str(record.get("product_id") or "")].append(record)
+        selected_product_ids = {
+            product.product_id for product in self._selected_live_products()
+        }
         product_rows = [
             product.to_dict()
             for product in self.registry.products.values()
-            if (product.role == "tradable" and product.is_tradable) or product.product_id in by_product
+            if (
+                (
+                    product.product_id in selected_product_ids
+                    or product.product_id in by_product
+                    or mode == "fixture"
+                )
+                and (include_raw or product.product_type.value != "option")
+            )
         ]
         # A live/replay snapshot with no observations has zero current
         # opportunities. The registry is still reported for diagnostics, but
         # it must never be mistaken for a usable market snapshot.
         candidate_rows = (
-            [product.to_dict() for product in self.registry.tradable_products()]
+            [
+                product.to_dict()
+                for product in self.registry.tradable_products()
+                if mode == "fixture" or product.product_id in selected_product_ids
+            ]
             if not data_unavailable else []
         )
         product_by_id = {row["product_id"]: row for row in product_rows}
@@ -318,6 +364,7 @@ class V2Engine:
                 technical,
                 mode,
                 decision_time,
+                include_raw=include_raw,
             )
 
         option_state = _option_states(records, product_by_id)
@@ -368,26 +415,45 @@ class V2Engine:
         global_quality = _quality(records, mode)
         readiness_by_product = {}
         for product_id, state in product_snapshots.items():
+            technical_state = state.get("technical") or {}
             horizons = state.get("features", {}).get("horizons", {})
             readiness_by_product[product_id] = {
-                horizon: {
-                    "analysis_readiness": value.get("analysis_readiness", False),
-                    "closed_counts": value.get("closed_counts", {}),
-                    "context_timeframe": value.get("context_timeframe"),
-                    "setup_timeframe": value.get("setup_timeframe"),
-                    "trigger_timeframe": value.get("trigger_timeframe"),
-                }
-                for horizon, value in horizons.items()
+                "ready_horizons": technical_state.get("ready_horizons", []),
+                "unavailable_horizons": technical_state.get("unavailable_horizons", list(horizons)),
+                "any_horizon_ready": technical_state.get("any_horizon_ready", False),
+                "all_horizons_ready": technical_state.get("all_horizons_ready", False),
+                "readiness_state": technical_state.get("readiness_state", "unavailable"),
+                "horizons": {
+                    horizon: {
+                        "analysis_readiness": value.get("analysis_readiness", False),
+                        "closed_counts": value.get("closed_counts", {}),
+                        "context_timeframe": value.get("context_timeframe"),
+                        "setup_timeframe": value.get("setup_timeframe"),
+                        "trigger_timeframe": value.get("trigger_timeframe"),
+                        "readiness_state": "ready" if value.get("analysis_readiness") else "unavailable",
+                    }
+                    for horizon, value in horizons.items()
+                },
             }
-        readiness_values = [
-            value.get("analysis_readiness")
-            for state in product_snapshots.values()
-            for value in (state.get("features", {}).get("horizons", {}) or {}).values()
-        ]
+        ready_product_count = sum(
+            1 for value in readiness_by_product.values()
+            if value.get("any_horizon_ready")
+        )
+        all_product_count = sum(
+            1 for value in readiness_by_product.values()
+            if value.get("all_horizons_ready")
+        )
         global_quality.update({
             "ingestion_quality": global_quality.get("quality"),
             "history_quality": "ready" if records else "data_unavailable",
-            "analysis_readiness": "ready" if readiness_values and any(readiness_values) else "insufficient_data",
+            "analysis_readiness": "ready" if ready_product_count else "insufficient_data",
+            "analysis_readiness_state": (
+                "ready" if all_product_count == len(readiness_by_product) and readiness_by_product
+                else "partial" if ready_product_count
+                else "unavailable"
+            ),
+            "ready_product_count": ready_product_count,
+            "all_horizons_ready_product_count": all_product_count,
             "execution_readiness": "read_only_shadow_only",
         })
         factors = factor_state(latest_return_by_underlying)
@@ -426,8 +492,8 @@ class V2Engine:
         )
 
         snapshot = build_snapshot(
-            registry=self.registry.to_dict(),
-            observations=records,
+            registry=_compact_registry(self.registry) if not include_raw else self.registry.to_dict(),
+            observations=records if include_raw else [],
             features={
                 "mode": mode,
                 "synthetic": mode == "fixture",
@@ -441,6 +507,7 @@ class V2Engine:
                     if global_quality["quality"] == "data_unavailable"
                     else "computed",
                 },
+                "data_references": _observation_references(records),
             },
             data_quality=global_quality,
             factor_state=factors,
@@ -463,7 +530,17 @@ class V2Engine:
         snapshot["synthetic"] = mode == "fixture"
         snapshot["data_unavailable"] = data_unavailable
         snapshot["history_readiness"] = readiness_by_product
-        snapshot["current_candidate_count"] = len(snapshot["ranked_candidates"])
+        stage_counts = _candidate_stage_counts(snapshot["ranked_candidates"])
+        snapshot["candidate_counts"] = stage_counts
+        snapshot["candidate_total_count"] = len(snapshot["ranked_candidates"])
+        snapshot["current_candidate_count"] = (
+            stage_counts["watching_candidate_count"]
+            + stage_counts["shadow_candidate_count"]
+            + stage_counts["actionable_candidate_count"]
+        )
+        snapshot["current_candidate_count_semantics"] = "non_diagnostic_current_candidates"
+        snapshot["raw_included"] = include_raw
+        snapshot["raw_data_available"] = bool(records)
         snapshot["stale_candidates"] = stale_candidates
         snapshot["stale_candidate_count"] = len(stale_candidates)
         snapshot["stale_candidate_snapshot_id"] = stale_snapshot_id
@@ -474,6 +551,11 @@ class V2Engine:
         self.last_decision = self._decision_from_snapshot(snapshot)
         self.storage.save_decision(snapshot["snapshot_id"], decision_time, self.last_decision)
         self.storage.save_candidates(snapshot["snapshot_id"], decision_time, snapshot["ranked_candidates"])
+        if not include_raw:
+            snapshot["registry"] = _compact_registry(self.registry)
+            snapshot["computed_features"]["product_snapshots"] = _compact_product_snapshots(
+                snapshot["computed_features"].get("product_snapshots", {})
+            )
         return snapshot
 
     def _apply_portfolio_risk(
@@ -513,6 +595,8 @@ class V2Engine:
         technical: dict[str, Any],
         mode: str,
         decision_time: datetime,
+        *,
+        include_raw: bool = False,
     ) -> dict[str, Any]:
         trade_rows = []
         for record in records:
@@ -595,11 +679,18 @@ class V2Engine:
             "product": product,
             "mode": mode,
             "data_quality": quality,
+            "readiness": {
+                "ready_horizons": technical.get("ready_horizons", []),
+                "unavailable_horizons": technical.get("unavailable_horizons", list(technical.get("horizons", {}))),
+                "any_horizon_ready": technical.get("any_horizon_ready", False),
+                "all_horizons_ready": technical.get("all_horizons_ready", False),
+                "readiness_state": technical.get("readiness_state", "unavailable"),
+            },
             "features": features,
             "technical": technical,
             "costs": costs,
             "product_context": product_context,
-            "observations": records,
+            "observations": records if include_raw else [],
             "as_of": latest_event.isoformat().replace("+00:00", "Z") if latest_event else None,
             "source_age_seconds": age,
             "session": _latest_session(records),
@@ -611,22 +702,26 @@ class V2Engine:
             item for item in candidates
             if item.get("direction") in {"long", "short"}
             and (item.get("valid_for_shadow") or item.get("valid_for_user_execution"))
+            and item.get("regime_compatibility") in {None, "compatible", "conditional"}
         ]
         top = rank_candidates(directional)[0] if directional else None
         no_trade_candidates = [
             item for item in candidates if item.get("direction") == "no_trade"
         ]
         no_trade = rank_candidates(no_trade_candidates)[0] if no_trade_candidates else None
-        selected = top or no_trade
         if snapshot.get("data_unavailable"):
             final_action = "data_unavailable"
             permission = "data_unavailable"
-        elif selected is None:
+            selected = None
+        elif top is None:
             final_action = "no_trade"
             permission = "no_trade"
+            selected = no_trade
         else:
-            final_action = selected.get("candidate_status") or "no_trade"
-            permission = selected.get("execution_permission") or "data_unavailable"
+            final_action = top.get("candidate_status") or "no_trade"
+            permission = top.get("execution_permission") or "data_unavailable"
+            selected = top
+        counts = snapshot.get("candidate_counts") or _candidate_stage_counts(candidates)
         setup_verdict = (
             "actionable" if top and str(top.get("candidate_status", "")).startswith("actionable_")
             else "research_only" if top else "no_trade"
@@ -642,10 +737,21 @@ class V2Engine:
             "account_status": (snapshot.get("account_overlay") or {}).get("status", "data_unavailable"),
             "market_view": snapshot.get("computed_features", {}).get("regime", {}),
             "setup_verdict": setup_verdict,
-            "setup_quality": selected.get("setup_quality") if selected else "unknown",
-            "selected_product_id": selected.get("product_id") if selected else None,
-            "candidate_rank": candidates,
-            "current_candidate_count": len(candidates),
+            "setup_quality": top.get("setup_quality") if top else "no_trade",
+            "selected_product_id": top.get("product_id") if top else None,
+            "selected_candidate_id": top.get("candidate_id") if top else (selected.get("candidate_id") if selected else None),
+            "candidate_rank": [] if snapshot.get("data_unavailable") else candidates,
+            "diagnostic_candidate_count": counts.get("diagnostic_candidate_count", 0),
+            "watching_candidate_count": counts.get("watching_candidate_count", 0),
+            "shadow_candidate_count": counts.get("shadow_candidate_count", 0),
+            "actionable_candidate_count": counts.get("actionable_candidate_count", 0),
+            "candidate_total_count": 0 if snapshot.get("data_unavailable") else len(candidates),
+            "current_candidate_count": 0 if snapshot.get("data_unavailable") else (
+                counts.get("watching_candidate_count", 0)
+                + counts.get("shadow_candidate_count", 0)
+                + counts.get("actionable_candidate_count", 0)
+            ),
+            "current_candidate_count_semantics": "non_diagnostic_current_candidates",
             "stale_candidates": snapshot.get("stale_candidates", []),
             "stale_candidate_count": snapshot.get("stale_candidate_count", 0),
             "stale_candidate_snapshot_id": snapshot.get("stale_candidate_snapshot_id"),
@@ -695,6 +801,208 @@ class V2Engine:
         ]
 
 
+
+def _compact_product(product: dict[str, Any]) -> dict[str, Any]:
+    keep = (
+        "product_id", "underlying_id", "provider", "venue", "venue_symbol",
+        "product_type", "quote_currency", "settlement_currency", "contract_size",
+        "tick_size", "lot_size", "min_order_size", "max_leverage",
+        "funding_supported", "short_supported", "trading_session",
+        "price_source", "is_tradable", "role", "execution_venue",
+        "market_data_provider", "maker_fee_bps", "taker_fee_bps",
+        "estimated_slippage_bps", "contract_type", "delivery_time", "expiry",
+        "settlement_asset", "underlying_reference", "underlying_session",
+        "discovery_payload_hash",
+    )
+    result = {key: product.get(key) for key in keep if key in product}
+    capabilities = product.get("capabilities") or {}
+    if capabilities:
+        result["capabilities_summary"] = {
+            "keys": sorted(str(key) for key in capabilities.keys()),
+            "delay_label": capabilities.get("delay_label"),
+        }
+    return result
+
+
+def _compact_registry(registry: Any) -> dict[str, Any]:
+    products = [
+        _compact_product(product.to_dict())
+        for product in registry.products.values()
+        if product.product_type.value != "option"
+    ]
+    non_option_ids = {
+        product.product_id
+        for product in registry.products.values()
+        if product.product_type.value != "option"
+    }
+    by_role = {
+        "tradable": sum(1 for product in registry.products.values() if product.role == "tradable" and product.is_tradable),
+        "reference": sum(1 for product in registry.products.values() if product.role == "reference" or not product.is_tradable),
+    }
+    return {
+        "assets": [asset.to_dict() for asset in registry.assets.values()],
+        "products": products,
+        "product_count": len(registry.products),
+        "non_option_product_count": len(products),
+        "option_product_count": sum(1 for product in registry.products.values() if product.product_type.value == "option"),
+        "counts_by_role": by_role,
+        "statuses": {
+            key: {
+                "supported": value.supported,
+                "configured": value.configured,
+                "status": value.status,
+                "reason": value.reason,
+            }
+            for key, value in registry.statuses.items()
+            if key in non_option_ids
+        },
+    }
+
+
+def _compact_technical(technical: dict[str, Any]) -> dict[str, Any]:
+    keep = (
+        "latest_close", "return_4", "return_24", "return_7d", "return_30d",
+        "atr_14_pct_closed", "rsi_14_closed", "adx_14", "plus_di_14",
+        "minus_di_14", "trend_state", "compression", "expansion",
+        "volatility_20", "donchian_position_20", "vwap", "analysis_readiness",
+        "ready_horizons", "unavailable_horizons", "any_horizon_ready",
+        "all_horizons_ready", "readiness_state",
+    )
+    return {key: technical.get(key) for key in keep if key in technical}
+
+
+def _compact_structure(structure: dict[str, Any]) -> dict[str, Any]:
+    keep = (
+        "state", "labels", "bos", "choch_proxy", "range_high", "range_low",
+        "range_touch_count", "failed_breakout", "sweep_reclaim",
+        "breakout_hold", "retest", "pullback_depth_atr",
+        "pivot_confirmation_time",
+    )
+    result = {key: structure.get(key) for key in keep if key in structure}
+    if isinstance(result.get("labels"), list):
+        result["labels"] = result["labels"][-6:]
+    return result
+
+
+def _compact_horizon(horizon: dict[str, Any]) -> dict[str, Any]:
+    keep = (
+        "horizon", "bias", "regime", "trend_strength", "momentum_state",
+        "volatility_state", "support", "resistance", "current_location",
+        "continuation_readiness", "countertrend_readiness", "invalidation",
+        "analysis_readiness", "context_timeframe", "setup_timeframe",
+        "trigger_timeframe", "closed_counts",
+    )
+    result = {key: horizon.get(key) for key in keep if key in horizon}
+    result["structure"] = _compact_structure(horizon.get("structure") or {})
+    result["technical"] = _compact_technical(horizon.get("technical") or {})
+    return result
+
+
+def _compact_relationships(values: dict[str, Any]) -> dict[str, Any]:
+    output = {}
+    for key, value in (values or {}).items():
+        if not isinstance(value, dict):
+            continue
+        output[key] = {
+            field: value.get(field)
+            for field in (
+                "usable", "ew_corr", "sample_count", "session_overlap_ratio",
+                "current_confirmation", "alignment",
+            )
+            if field in value
+        }
+    return output
+
+
+def _compact_product_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    features = state.get("features") or {}
+    compact_features = dict(features)
+    compact_features["technical"] = _compact_technical(features.get("technical") or {})
+    compact_features["horizons"] = {
+        key: _compact_horizon(value)
+        for key, value in (features.get("horizons") or {}).items()
+    }
+    micro = features.get("microstructure") or {}
+    cvd = micro.get("trade_cvd") or {}
+    orderbook = micro.get("orderbook") or {}
+    compact_features["microstructure"] = {
+        "trade_cvd": {
+            key: cvd.get(key)
+            for key in ("quality", "quantity_cvd", "notional_cvd", "notional_cvd_ratio", "duplicate_count", "out_of_order_count")
+            if key in cvd
+        },
+        "orderbook": {
+            key: orderbook.get(key)
+            for key in ("quality", "best_bid", "best_ask", "mid_price", "spread_bps", "distance_weighted_imbalance_0.25%", "liquidity_vacuum_score")
+            if key in orderbook
+        },
+    }
+    compact_features["derivatives_state"] = {
+        key: (features.get("derivatives_state") or {}).get(key)
+        for key in ("quality", "weighted_funding", "annualized_basis", "venue_oi_share", "observation_count")
+        if key in (features.get("derivatives_state") or {})
+    }
+    compact_features["cross_asset_state"] = _compact_relationships(features.get("cross_asset_state") or {})
+    return {
+        "product": _compact_product(state.get("product") or {}),
+        "mode": state.get("mode"),
+        "data_quality": state.get("data_quality") or {},
+        "readiness": state.get("readiness") or {},
+        "features": compact_features,
+        "costs": state.get("costs") or {},
+        "product_context": state.get("product_context") or {},
+        "observations": [],
+        "as_of": state.get("as_of"),
+        "source_age_seconds": state.get("source_age_seconds"),
+        "session": state.get("session"),
+        "cross_asset_state": _compact_relationships(state.get("cross_asset_state") or {}),
+    }
+
+
+def _compact_product_snapshots(values: dict[str, Any]) -> dict[str, Any]:
+    return {
+        product_id: _compact_product_snapshot(state)
+        for product_id, state in values.items()
+    }
+
+
+def _observation_references(records: list[dict[str, Any]]) -> dict[str, Any]:
+    by_type: dict[str, int] = defaultdict(int)
+    by_provider: dict[str, int] = defaultdict(int)
+    products: set[str] = set()
+    for record in records:
+        by_type[str(record.get("data_type") or "unknown")] += 1
+        by_provider[str(record.get("provider") or "unknown")] += 1
+        if record.get("product_id"):
+            products.add(str(record["product_id"]))
+    return {
+        "observation_count": len(records),
+        "by_data_type": dict(sorted(by_type.items())),
+        "by_provider": dict(sorted(by_provider.items())),
+        "product_count": len(products),
+        "raw_endpoint": "/api/v2/raw",
+    }
+
+
+def _candidate_stage_counts(candidates: Any) -> dict[str, int]:
+    counts = {
+        "diagnostic_candidate_count": 0,
+        "watching_candidate_count": 0,
+        "shadow_candidate_count": 0,
+        "actionable_candidate_count": 0,
+    }
+    stage_map = {
+        "diagnostic_candidate": "diagnostic_candidate_count",
+        "watching_candidate": "watching_candidate_count",
+        "triggered_shadow_candidate": "shadow_candidate_count",
+        "shadow_eligible_candidate": "shadow_candidate_count",
+        "user_actionable_candidate": "actionable_candidate_count",
+    }
+    for candidate in candidates or []:
+        stage = str(candidate.get("candidate_stage") if isinstance(candidate, dict) else getattr(candidate, "candidate_stage", "diagnostic_candidate"))
+        counts[stage_map.get(stage, "diagnostic_candidate_count")] += 1
+    return counts
+
 def _merge_records(current: list[dict[str, Any]], stored: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: dict[tuple[str, str, str], dict[str, Any]] = {}
     for record in [*stored, *current]:
@@ -727,9 +1035,24 @@ def _technical(records: list[dict[str, Any]], minimum: int) -> dict[str, Any]:
     )
     base = closed_candle_features(selected, minimum_samples=min(30, minimum))
     horizons = analyze_horizons(by_timeframe, minimum_samples=min(30, minimum))
-    ready = all(item.get("analysis_readiness") for item in horizons.values())
+    ready_horizons = [
+        name for name, item in horizons.items()
+        if item.get("analysis_readiness") is True
+    ]
+    unavailable_horizons = [
+        name for name, item in horizons.items()
+        if item.get("analysis_readiness") is not True
+    ]
+    any_ready = bool(ready_horizons)
+    all_ready = bool(horizons) and not unavailable_horizons
+    readiness_state = "ready" if all_ready else "partial" if any_ready else "unavailable"
     base["horizons"] = horizons
-    base["analysis_readiness"] = ready
+    base["analysis_readiness"] = any_ready
+    base["ready_horizons"] = ready_horizons
+    base["unavailable_horizons"] = unavailable_horizons
+    base["any_horizon_ready"] = any_ready
+    base["all_horizons_ready"] = all_ready
+    base["readiness_state"] = readiness_state
     base["regime"] = {
         "state": next(
             (item.get("regime") for item in horizons.values() if item.get("analysis_readiness")),
@@ -738,7 +1061,6 @@ def _technical(records: list[dict[str, Any]], minimum: int) -> dict[str, Any]:
         "horizons": {key: value.get("regime") for key, value in horizons.items()},
     }
     return base
-
 
 def _quality(records: list[dict[str, Any]], mode: str) -> dict[str, Any]:
     if not records:

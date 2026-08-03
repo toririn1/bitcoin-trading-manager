@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from collections import Counter
 
 from engine_v2.domain.enums import DataQuality
 from engine_v2.domain.registry import AssetRegistry
@@ -25,7 +25,11 @@ class MarketDataManager:
     def _result_quality_ok(result: ProviderResult) -> bool:
         return result.quality in {DataQuality.OK, DataQuality.PARTIAL, DataQuality.DELAYED}
 
-    def _record_result(self, provider: str, result: ProviderResult, latency_ms: float) -> None:
+    def _record_result(self, provider: str, result: ProviderResult, latency_ms: float, *, operation: str) -> None:
+        counts = Counter()
+        for observation in result.data:
+            if observation.data_type.startswith("candle_"):
+                counts[observation.data_type.removeprefix("candle_")] += 1
         if self._result_quality_ok(result):
             self.health_registry.success(
                 provider,
@@ -33,12 +37,15 @@ class MarketDataManager:
                 notes=[result.reason] if result.reason else None,
                 quality=result.quality,
                 observation_count=len(result.data),
+                candle_count_by_timeframe=dict(counts),
+                operation=operation,
             )
         else:
             self.health_registry.error(
                 provider,
                 result.reason or result.quality.value,
                 quality=result.quality,
+                operation=operation,
             )
 
     async def discover(self, underlying_ids: list[str] | None = None) -> list[ProviderResult]:
@@ -49,10 +56,10 @@ class MarketDataManager:
                 self.health_registry.attempt(provider.name)
                 result = await provider.discover_products(underlying_ids)
                 self.registry.register_discovered_products(result.products)
-                self._record_result(provider.name, result, (time.perf_counter() - started) * 1000)
+                self._record_result(provider.name, result, (time.perf_counter() - started) * 1000, operation="discovery")
             except Exception as exc:
-                self.health_registry.error(provider.name, type(exc).__name__)
-                result = ProviderResult(provider.name, quality=DataQuality.PROVIDER_ERROR, reason=str(exc))
+                self.health_registry.error(provider.name, type(exc).__name__, operation="discovery")
+                result = ProviderResult(provider.name, quality=DataQuality.PROVIDER_ERROR, reason=f"{type(exc).__name__}:{exc}")
             results.append(result)
         return results
 
@@ -68,11 +75,11 @@ class MarketDataManager:
             self.health_registry.attempt(provider.name)
             result = await provider.backfill(product, timeframe=timeframe, limit=limit)
             self.storage.append_observations(result.data)
-            self._record_result(provider.name, result, (time.perf_counter() - started) * 1000)
+            self._record_result(provider.name, result, (time.perf_counter() - started) * 1000, operation="market_data")
             return result
         except Exception as exc:
-            self.health_registry.error(provider.name, type(exc).__name__)
-            return ProviderResult(provider.name, quality=DataQuality.PROVIDER_ERROR, reason=str(exc))
+            self.health_registry.error(provider.name, type(exc).__name__, operation="market_data")
+            return ProviderResult(provider.name, quality=DataQuality.PROVIDER_ERROR, reason=f"{type(exc).__name__}:{exc}")
 
     async def backfill_history(
         self,

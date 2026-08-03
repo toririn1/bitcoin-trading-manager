@@ -5,7 +5,7 @@ from typing import Any, Iterable
 from engine_v2.domain.enums import Direction
 from engine_v2.domain.models import OpportunityCandidate
 
-from .scorer import score_candidate
+from .scorer import direction_is_semantically_allowed, score_candidate
 
 
 def scan_opportunities(products: Iterable[dict[str, Any]], snapshot: dict[str, Any], *, min_net_edge_bps: float = 8.0) -> list[OpportunityCandidate]:
@@ -14,13 +14,32 @@ def scan_opportunities(products: Iterable[dict[str, Any]], snapshot: dict[str, A
         if product.get("role") != "tradable" or not product.get("is_tradable"):
             continue
         directions = [Direction.LONG]
-        if product.get("short_supported") and product.get("product_type") != "spot":
+        if product.get("short_supported") and product.get("product_type") not in {"spot", "equity", "etf"}:
             directions.append(Direction.SHORT)
         directions.append(Direction.NO_TRADE)
-        horizons = list((snapshot.get("horizons") or {}).keys()) or ["intraday"]
+        horizons_map = snapshot.get("horizons") or {}
+        if horizons_map:
+            horizons = list(horizons_map)
+        else:
+            # Preserve the old direct scorer contract for fixture/unit callers;
+            # production snapshots always carry explicit four-horizon analysis.
+            horizons_map = {
+                "intraday": {
+                    "analysis_readiness": True,
+                    "regime": "trend_up",
+                    "bias": "long",
+                    "continuation_readiness": True,
+                    "structure": {"labels": [{"label": "HH"}]},
+                    "technical": {"latest_close": (snapshot.get("features") or {}).get("technical", {}).get("latest_close")},
+                }
+            }
+            horizons = ["intraday"]
         for horizon in horizons:
+            analysis = horizons_map.get(horizon) or {}
             for direction in directions:
-                candidates.append(score_candidate(product, direction, snapshot, min_net_edge_bps=min_net_edge_bps, horizon_name=horizon))
+                if direction != Direction.NO_TRADE and not direction_is_semantically_allowed(product, analysis, direction):
+                    continue
+                candidates.append(score_candidate(product, direction, {**snapshot, "horizons": horizons_map}, min_net_edge_bps=min_net_edge_bps, horizon_name=horizon))
     return rank_candidates(candidates)
 
 

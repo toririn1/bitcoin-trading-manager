@@ -89,7 +89,13 @@ def replay_candidate(
             entry_index = index
             break
     if entry_index is None:
-        return _result(candidate, "not_triggered", "trigger_not_touched", trigger_price=trigger)
+        if candidate.get("trigger_fired") is True:
+            # The trigger was already confirmed in the source snapshot. Future
+            # candles therefore begin after the entry; do not mislabel this as
+            # an untriggered candidate and discard its gross outcome.
+            entry_index = 0
+        else:
+            return _result(candidate, "not_triggered", "trigger_not_touched", trigger_price=trigger)
 
     sign = 1 if direction == "long" else -1
     fill_price = trigger * (1 + sign * cfg.slippage_bps / 10000)

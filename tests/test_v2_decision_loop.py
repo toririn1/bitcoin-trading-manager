@@ -176,9 +176,9 @@ def test_fixture_weak_directional_candidates_cannot_enter_shadow(tmp_path, monke
         item for item in snapshot["ranked_candidates"]
         if item["direction"] in {"long", "short"}
     ]
-    assert directional
-    assert all(item["valid_for_shadow"] is False for item in directional)
-    assert all("heuristic_below_threshold" in item["reason_codes"] for item in directional)
+    # Insufficient multi-horizon history must not produce directional strategy
+    # candidates; the decision remains an explicit no-trade.
+    assert directional == []
     assert engine.last_decision["final_action"] == "no_trade"
     assert engine.storage.open_candidates() == []
 
@@ -321,6 +321,10 @@ def test_shadow_candidate_stays_open_before_expiry(tmp_path, monkeypatch):
     settings = V2Settings(mode="fixture", live_enabled=False, duckdb_path="data/x.duckdb", parquet_root="data/raw")
     engine = V2Engine(tmp_path, settings)
     candidate = _strong_shadow_candidate()
+    # This regression fixture specifically represents a watched (not yet
+    # trigger-fired) candidate; triggered candidates are intentionally tracked
+    # from the confirmed entry in the new lifecycle contract.
+    candidate["trigger_fired"] = False
     now = datetime.now(timezone.utc)
     candidate["time_expiry"] = (now + timedelta(hours=12)).isoformat().replace("+00:00", "Z")
     assert engine.storage.save_candidates("expiry-snapshot", now, [candidate]) == 1

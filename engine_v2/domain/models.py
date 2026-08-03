@@ -385,6 +385,12 @@ class OpportunityCandidate:
     analysis_readiness: bool = False
     failure_conditions: list[str] = field(default_factory=list)
     candidate_stage: str = "diagnostic_candidate"
+    trigger_fired: bool = False
+    trigger_fired_at: datetime | None = None
+    trigger_evidence: dict[str, Any] = field(default_factory=dict)
+    watched_since: datetime | None = None
+    cost_unknown: bool = False
+    gross_return: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return to_dict(asdict(self))

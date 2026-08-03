@@ -51,11 +51,14 @@ class BybitPublicProvider(MarketDataProvider):
                 continue
             lot = item.get("lotSizeFilter") or {}
             price = item.get("priceFilter") or {}
-            contract_type, expiry = classify_contract(item, product_type=ProductType.PERPETUAL)
+            product_type = ProductType.PERPETUAL
+            contract_type, expiry = classify_contract(item, product_type=product_type)
+            if contract_type == "unknown":
+                # Unknown instruments must never masquerade as a tradable perp.
+                continue
             if contract_type != "perpetual":
-                # Dated/unknown products must not masquerade as perpetuals.
                 product_type = ProductType.FUTURE if contract_type == "dated_future" else ProductType.PERPETUAL
-            product_id = canonical_product_id(base, "BYBIT", contract_type, expiry)
+            product_id = canonical_product_id(base, "BYBIT", contract_type, expiry, venue_symbol=symbol)
             products.append(ProductSpec(product_id, base, self.name, "bybit_linear", symbol, product_type, quote_currency=item.get("quoteCoin"), settlement_currency=item.get("settleCoin"), contract_size=_number(item.get("contractSize")), tick_size=_number(price.get("tickSize")), lot_size=_number(lot.get("qtyStep")), min_order_size=_number(lot.get("minOrderQty")), max_leverage=_number((item.get("leverageFilter") or {}).get("maxLeverage")), funding_supported=contract_type == "perpetual", short_supported=contract_type in {"perpetual", "dated_future"}, price_source="bybit_public", is_tradable=contract_type in {"perpetual", "dated_future"}, role="tradable" if contract_type in {"perpetual", "dated_future"} else "reference", capabilities={"instrument": item}, discovered_at=datetime.now(timezone.utc), contract_type=contract_type, expiry=expiry, delivery_time=expiry, settlement_asset=item.get("settleCoin"), underlying_reference=base, discovery_payload_hash=payload_hash(item)))
         return ProviderResult(self.name, products=products, request_count=1)
 

@@ -125,7 +125,7 @@ def test_technical_trigger_can_be_shadow_eligible_without_cost_or_calibration():
     )
     assert candidate.valid_for_shadow is True
     assert candidate.valid_for_user_execution is False
-    assert candidate.candidate_stage == "shadow_eligible_candidate"
+    assert candidate.candidate_stage == "triggered_shadow_candidate"
     assert candidate.cost_quality == "missing"
     assert candidate.trigger_timeframe == "5m"
     assert candidate.stop_price is not None

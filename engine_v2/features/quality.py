@@ -26,6 +26,9 @@ def aggregate_quality(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
         return {"quality": DataQuality.PARTIAL.value, "score": 0, "missing": ["no_observations"]}
     missing = [str(row.get("reason") or row.get("data_type") or "unknown") for row in values if row.get("quality") not in {DataQuality.OK.value, DataQuality.PARTIAL.value, "ok", "partial"}]
     score = max(0, min(100, round(sum(100 + quality_penalty(row.get("quality", "unknown")) for row in values) / len(values))))
+    if missing:
+        # A large OK sample can otherwise round a partial dataset back to 100.
+        score = min(score, max(0, 100 - 5 * len(set(missing))))
     return {"quality": "ok" if not missing else "partial", "score": score, "missing": missing, "observation_count": len(values)}
 
 

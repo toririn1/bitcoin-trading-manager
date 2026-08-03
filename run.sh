@@ -41,10 +41,13 @@ if [ ! -f ".env" ]; then
   echo ""
 fi
 
+UVICORN_GRACEFUL_SHUTDOWN_SECS="${UVICORN_GRACEFUL_SHUTDOWN_SECS:-5}"
+
 UVICORN_ARGS=(
   server:app
   --host 0.0.0.0
   --port 8000
+  --timeout-graceful-shutdown "${UVICORN_GRACEFUL_SHUTDOWN_SECS}"
 )
 
 if [[ "${UVICORN_RELOAD:-false}" =~ ^(1|true|yes)$ ]]; then

@@ -81,7 +81,25 @@ def classify_contract(item: dict[str, Any], *, product_type: ProductType | None 
     return "unknown", expiry
 
 
-def canonical_product_id(base: str, venue: str, contract_type: str, expiry: datetime | None = None) -> str:
+def _symbol_token(symbol: str | None) -> str:
+    value = re.sub(r"[^A-Z0-9]+", "", str(symbol or "").upper())
+    return value
+
+
+def canonical_product_id(
+    base: str,
+    venue: str,
+    contract_type: str,
+    expiry: datetime | None = None,
+    venue_symbol: str | None = None,
+) -> str:
+    '''Return a stable public ID that keeps the exact venue symbol visible.
+
+    Perpetual/spot symbols are part of identity because one underlying can have
+    multiple quote, margin, or settlement variants on the same venue. Dated
+    futures retain the compact expiry form because the expiry is already part
+    of their canonical identity.
+    '''
     tag = {
         "perpetual": "PERP",
         "spot": "SPOT",
@@ -90,5 +108,7 @@ def canonical_product_id(base: str, venue: str, contract_type: str, expiry: date
         "cfd": "CFD",
         "tradifi_perpetual": "TRADIFI_PERP",
     }.get(contract_type, "UNKNOWN")
+    symbol = _symbol_token(venue_symbol)
+    identity_symbol = f"_{symbol}" if symbol and contract_type != "dated_future" else ""
     suffix = f"_{expiry.astimezone(timezone.utc):%Y%m%d}" if contract_type == "dated_future" and expiry else ""
-    return f"{base.upper()}_{venue.upper()}_{tag}{suffix}"
+    return f"{base.upper()}_{venue.upper()}{identity_symbol}_{tag}{suffix}"
